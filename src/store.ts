@@ -35,6 +35,8 @@ export interface Loop {
 	followUpPrompt?: string;
 	/** Message action: whether to trigger an agent turn. Default true. */
 	triggerTurn?: boolean;
+	/** Force delivery: when the agent is busy, steer this loop's fire in at the next tool-call boundary instead of deferring to agent_settled. */
+	force?: boolean;
 	/** Lifecycle. */
 	enabled: boolean;
 	maxFires?: number;
@@ -66,6 +68,7 @@ export interface NewLoopInput {
 	timeoutMs?: number;
 	followUpPrompt?: string;
 	triggerTurn?: boolean;
+	force?: boolean;
 	enabled?: boolean;
 	maxFires?: number;
 }
@@ -184,6 +187,7 @@ export class LoopStore {
 			timeoutMs: input.timeoutMs,
 			followUpPrompt: input.followUpPrompt,
 			triggerTurn: input.triggerTurn,
+			force: input.force,
 			enabled: input.enabled ?? true,
 			maxFires: input.maxFires,
 			runCount: 0,
@@ -267,6 +271,7 @@ function normalizeLoop(raw: unknown): Loop | undefined {
 		timeoutMs: typeof r.timeoutMs === "number" ? r.timeoutMs : undefined,
 		followUpPrompt: typeof r.followUpPrompt === "string" ? r.followUpPrompt : undefined,
 		triggerTurn: typeof r.triggerTurn === "boolean" ? r.triggerTurn : undefined,
+		force: typeof r.force === "boolean" ? r.force : undefined,
 		enabled: typeof r.enabled === "boolean" ? r.enabled : status === "active",
 		maxFires: typeof r.maxFires === "number" ? r.maxFires : undefined,
 		runCount: typeof r.runCount === "number" ? r.runCount : 0,

@@ -119,7 +119,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 	// fires of the same loop collapse to the latest — drained as ONE consolidated
 	// turn at agent_settled. Prevents the flood of chained followUp turns during
 	// long multi-turn runs (e.g. a goal skill).
-	const pendingFires = new Map<string, { loop: Loop; firedAt: string; prompt: string }>();
+	const pendingFires = new Map<string, { loop: Loop; firedAt: string; prompt: string; force: boolean }>();
+	// Per-turn steer coalesce flag: at most one steer per turn window so a forced
+	// (!) loop never bursts. Reset on turn_end.
+	let steeredThisTurn = false;
 	let activeCtx: ExtensionContext | undefined;
 	let loopWidget: LoopWidget | undefined;
 
@@ -165,9 +168,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 				: theme.fg("dim", (l.status === "done" ? "done" : "paused").padEnd(12).slice(0, 12));
 			const runs = theme.fg("dim", `×${l.runCount}`);
 			const act = theme.fg("accent", l.action);
-			// ⏳ marks loops whose wake is buffered (fired while the agent was busy).
-			const queued = pendingFires.has(l.id) ? " " + theme.fg("warning", "⏳") : "";
-			lines.push(`  ${glyph} ${name} ${sched} ${nr} ${runs}  ${act}${queued}`);
+			// `!` marks forced loops (steer mid-run when busy); ⏳ marks a buffered fire.
+			const mark = (l.force ? " " + theme.fg("warning", "!") : "") + (pendingFires.has(l.id) ? " " + theme.fg("warning", "⏳") : "");
+			lines.push(`  ${glyph} ${name} ${sched} ${nr} ${runs}  ${act}${mark}`);
 		}
 		return lines;
 	}
@@ -262,10 +265,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	// ─── Firing ────────────────────────────────────────────────────────────────
 
-	async function fire(id: string, ctx: ExtensionContext, force = false): Promise<void> {
+	async function fire(id: string, ctx: ExtensionContext, manual = false): Promise<void> {
 		const loop = store.get(id);
 		if (!loop || loop.status === "done" || loop.status === "error") return;
-		if (!force && !loop.enabled) return; // pause stops the schedule, not a manual "run now"
+		if (!manual && !loop.enabled) return; // pause stops the schedule, not a manual "run now"
 		if (firing.has(id)) return; // overlap guard
 		firing.add(id);
 		try {
@@ -405,13 +408,25 @@ export default function loopExtension(pi: ExtensionAPI) {
 			pi.sendUserMessage(prompt);
 			return;
 		}
-		// Busy: buffer instead of queueing as followUp. Repeated fires of the same
-		// loop overwrite (latest wins), so a 5m loop during a 30m run collapses to
-		// ONE pending entry — drained as a single consolidated turn at agent_settled.
-		pendingFires.set(loop.id, { loop, firedAt: new Date().toISOString(), prompt });
+		// Busy. Buffer (coalesced per loop). force (!) loops steer at the next
+		// tool-call boundary; default loops defer to agent_settled.
+		pendingFires.set(loop.id, { loop, firedAt: new Date().toISOString(), prompt, force: !!loop.force });
+		if (loop.force) maybeSteer(ctx);
 	}
 
-	/** Drain buffered fires as ONE consolidated user message. Called at agent_settled. */
+	/** Coalesced steer for forced (!) loops: at most one steer per turn window. */
+	function maybeSteer(ctx: ExtensionContext) {
+		if (steeredThisTurn) return;
+		const forced = [...pendingFires.values()].filter((e) => e.force);
+		if (forced.length === 0) return;
+		for (const e of forced) pendingFires.delete(e.loop.id); // delivered via steer
+		steeredThisTurn = true;
+		updateUI(ctx);
+		const body = forced.map((e) => e.prompt).join("\n\n---\n\n");
+		pi.sendUserMessage(`[Forced loops fired — interrupting at the next tool-call boundary]\n\n${body}`, { deliverAs: "steer" });
+	}
+
+	/** Drain buffered (default-deferred) fires as ONE consolidated user message. Called at agent_settled. */
 	function drainPending(ctx: ExtensionContext) {
 		if (pendingFires.size === 0) return;
 		if (!ctx.isIdle()) return; // another extension started a run; wait for next settle
@@ -449,6 +464,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		timeoutMs?: number;
 		followUpPrompt?: string;
 		triggerTurn?: boolean;
+		force?: boolean;
 		enabled?: boolean;
 		maxFires?: number;
 	}, ctx: ExtensionContext): Loop {
@@ -478,6 +494,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 				timeoutMs: params.timeoutMs,
 				followUpPrompt: params.followUpPrompt,
 				triggerTurn: params.triggerTurn,
+				force: params.force,
 				enabled: params.enabled,
 				maxFires: params.maxFires,
 			},
@@ -488,10 +505,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return loop;
 	}
 
-	// Drain buffered fires as one consolidated turn when the agent truly settles.
-	// This is the fix for the multi-turn flood: fires that happened while busy
-	// (e.g. during a goal skill) are coalesced here instead of chaining as followUps.
+	// Reset the per-turn steer coalesce flag so forced (!) loops can steer again next turn.
+	pi.on("turn_end", async () => {
+		steeredThisTurn = false;
+	});
+
+	// Drain buffered (default-deferred) fires as one consolidated turn when the
+	// agent truly settles. Forced (!) loops are steered mid-run (see maybeSteer).
 	pi.on("agent_settled", async (_event, ctx) => {
+		steeredThisTurn = false;
 		drainPending(ctx);
 	});
 
@@ -602,7 +624,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 	function runLoopNow(loop: Loop, ctx: ExtensionContext) {
 		ctx.ui.notify(`Firing "${loop.name}" now…`, "info");
-		void fire(loop.id, ctx, true); // force: fires even while paused, without un-pausing
+		void fire(loop.id, ctx, true); // manual: fires even while paused, without un-pausing
 	}
 
 	async function controlLoop(verb: string, query: string, ctx: ExtensionContext) {
@@ -622,7 +644,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 	pi.registerCommand("loop", {
 		description: "Create or control scheduled loops. With no args, opens the manager.",
 		handler: async (args, ctx) => {
-			const trimmed = args.trim();
+			let trimmed = args.trim();
+			// `!` prefix → forced loop (steer at next tool-call boundary when busy, vs defer to agent_settled).
+			let force = false;
+			if (trimmed.startsWith("!")) {
+				force = true;
+				trimmed = trimmed.slice(1).trimStart();
+			}
 			if (!trimmed) return manage(ctx); // wizard
 
 			const tokens = tokenize(trimmed);
@@ -655,12 +683,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const payload = restTokens.slice(1).join(" ");
 
 			try {
-				const params: Parameters<typeof createLoop>[0] = { action, schedule };
+				const params: Parameters<typeof createLoop>[0] = { action, schedule, force };
 				if (action === "prompt") params.prompt = payload;
 				else if (action === "notify" || action === "message") params.message = payload;
 				else if (action === "shell") params.command = payload;
 				const loop = createLoop(params, ctx);
-				ctx.ui.notify(`Created ${action} loop "${loop.name}" (${loopScheduleLabel(loop)})`, "info");
+				ctx.ui.notify(`Created ${action} loop "${loop.name}" (${loopScheduleLabel(loop)})${force ? " [forced]" : ""}`, "info");
 			} catch (err) {
 				ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
 			}
@@ -789,9 +817,19 @@ export default function loopExtension(pi: ExtensionAPI) {
 			}
 		}
 
+		// Force (!): steer the fire in at the next tool-call boundary when the agent is busy,
+		// instead of deferring to the end of the run.
+		let force = false;
+		if (action === "prompt" || action === "shell" || action === "message") {
+			force = await ctx.ui.confirm(
+				"Force interrupt?",
+				"If the agent is busy when this fires, inject at the next tool-call boundary (!) instead of waiting for it to finish.",
+			);
+		}
+
 		try {
 			const loop = createLoop(
-				{ action, type, schedule, name, prompt, message, command, followUpPrompt, maxFires },
+				{ action, type, schedule, name, prompt, message, command, followUpPrompt, maxFires, force },
 				ctx,
 			);
 			ctx.ui.notify(`Created loop "${loop.name}" (${loopScheduleLabel(loop)})`, "info");
@@ -882,6 +920,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 			enabled: Type.Optional(Type.Boolean({ description: "Start enabled. Default true." })),
 			triggerTurn: Type.Optional(
 				Type.Boolean({ description: "Message action: trigger an agent turn. Default true." }),
+			),
+			force: Type.Optional(
+				Type.Boolean({ description: "Force: when the agent is busy, steer the fire in at the next tool-call boundary instead of deferring to agent_settled." }),
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
