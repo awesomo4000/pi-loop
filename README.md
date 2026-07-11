@@ -7,15 +7,10 @@ Wake the agent with a prompt, fire a reminder, run a command, or post a message 
 ## Install
 
 ```bash
-pi install github.com/davidroman0O/pi-loop
+pi install npm:davidroman0O/pi-loop
 ```
 
-Or clone into your extensions dir, then `/reload`:
-
-```bash
-git clone https://github.com/davidroman0O/pi-loop ~/.pi/agent/extensions/pi-loop
-cd ~/.pi/agent/extensions/pi-loop && npm install
-```
+Then `/reload` in pi. You'll see the `🔁 loops` chip in the footer once a loop exists.
 
 ## Quick start
 
