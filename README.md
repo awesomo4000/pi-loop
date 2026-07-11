@@ -112,15 +112,16 @@ No command needed — the widget under the editor always shows every loop:
   ● build-check    every 5m         in 4m        ×3   prompt
   ○ standup        cron 0 9 * * 1-5 in 14h       ×0   prompt
   ❚❚ deploys       every 1h         paused       ×12  shell
-  ✓ morning-sync   once +1h         done         ×1   prompt
+  ✗ broken-watch   every 30s        errored      ×2   shell
 ```
 
 | Glyph | Meaning |
 |---|---|
 | `●` | active |
 | `❚❚` | paused |
-| `✓` | done (one-shot fired, or maxFires reached) |
-| `✗` | errored |
+| `✗` | errored (last run failed) |
+
+Finished loops (a `once` that fired, or one that hit `maxFires`) are removed automatically — the widget shows only loops that still have work to do.
 
 ## Let the agent schedule itself
 

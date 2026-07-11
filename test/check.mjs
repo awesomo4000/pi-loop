@@ -78,14 +78,14 @@ console.log("# Live interval firing — 50ms x5, must fire exactly 5x then stop"
       const plan = planFire(loop, new Date());
       fires.push(Date.now() - start);
       s.update(id, { runCount: plan.runCount });
-      if (plan.terminal) { s.update(id, { enabled: false, status: "done", nextRun: undefined }); return; }
+      if (plan.terminal) { s.remove(id); return; }
       go();
     }, loop.intervalMs);
   };
   go();
   await new Promise((r) => setTimeout(r, 600));
   check("fired exactly 5 times", () => assert.equal(fires.length, 5));
-  check("marked done after 5", () => assert.equal(s.get(id).status, "done"));
+  check("removed after 5 fires", () => assert.equal(s.get(id), undefined));
   check("recurrence held (gaps 30-200ms)", () => {
     const gaps = fires.slice(1).map((t, i) => t - fires[i]);
     assert.ok(gaps.every((g) => g > 30 && g < 200), `gaps: ${gaps.join(",")}`);

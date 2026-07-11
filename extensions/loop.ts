@@ -250,17 +250,16 @@ export default function loopExtension(pi: ExtensionAPI) {
 			} catch (err) {
 				ok = false;
 				errMsg = err instanceof Error ? err.message : String(err);
+				record(ctx, `â  Loop "${loop.name || loop.id}" failed: ${errMsg}`, { loop, error: errMsg });
 			}
 
 			// Finalize state.
 			if (plan.terminal) {
-				store.update(id, {
-					enabled: false,
-					status: ok ? "done" : "error",
-					nextRun: undefined,
-					lastStatus: ok ? "success" : "error",
-					lastError: errMsg,
-				});
+				// Finished its life (once fired, or maxFires reached) → remove it.
+				// The widget shows only active/pending work; the fire's outcome was
+				// already recorded in the transcript above.
+				disarm(id);
+				store.remove(id);
 			} else {
 				store.update(id, {
 					lastStatus: ok ? "success" : "error",
@@ -285,7 +284,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}
 
 		if (loop.action === "prompt") {
-			const prompt = buildPromptHeader(loop) + (loop.prompt || "");
+			const prompt = buildPromptHeader(loop) + "\n\n" + (loop.prompt || "");
 			sendAgentPrompt(ctx, prompt);
 			return;
 		}
@@ -346,12 +345,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function buildPromptHeader(loop: Loop): string {
 		const parsed = safeParsed(loop);
 		const schedLabel = parsed ? describeSchedule(parsed) : loopScheduleLabel(loop);
-		return [
-			`[Loop "${loop.name || loop.id}" fired]`,
-			`Action: ${loop.action}  ·  Schedule: ${schedLabel}`,
-			`Run ${loop.runCount + 1}${loop.maxFires ? ` of ${loop.maxFires}` : ""}`,
-			"",
-		].join("\n");
+		const run = loop.runCount + 1;
+		const runLabel = loop.maxFires ? `${run}/${loop.maxFires}` : `${run}`;
+		// One compact line — the header is metadata, not the instruction. Don't burn tokens.
+		return `[Loop "${loop.name || loop.id}" fired · ${loop.action} · ${schedLabel} · run ${runLabel}]`;
 	}
 
 	function sendAgentPrompt(ctx: ExtensionContext, prompt: string) {
