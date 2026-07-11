@@ -213,9 +213,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	// ─── Firing ────────────────────────────────────────────────────────────────
 
-	async function fire(id: string, ctx: ExtensionContext): Promise<void> {
+	async function fire(id: string, ctx: ExtensionContext, force = false): Promise<void> {
 		const loop = store.get(id);
-		if (!loop || !loop.enabled || loop.status === "done" || loop.status === "error") return;
+		if (!loop || loop.status === "done" || loop.status === "error") return;
+		if (!force && !loop.enabled) return; // pause stops the schedule, not a manual "run now"
 		if (firing.has(id)) return; // overlap guard
 		firing.add(id);
 		try {
@@ -227,7 +228,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			// re-fires on its own; we only stop it if terminal.
 			if (plan.terminal) {
 				disarm(id);
-			} else if (loop.type === "interval" && plan.nextDelayMs !== undefined) {
+			} else if (loop.enabled && loop.type === "interval" && plan.nextDelayMs !== undefined) {
 				const delay = Math.min(plan.nextDelayMs, MAX_TIMER_DELAY_MS);
 				const timer = setTimeout(() => {
 					handles.delete(id);
@@ -364,6 +365,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	// ─── Create helper ─────────────────────────────────────────────────────────
 
+	/** Derive a short loop name from the payload when no explicit name is set. */
+	function deriveName(params: { prompt?: string; message?: string; command?: string }): string | undefined {
+		const raw = (params.prompt ?? params.message ?? params.command ?? "").replace(/\s+/g, " ").trim();
+		if (!raw) return undefined;
+		return raw.length > 40 ? `${raw.slice(0, 37)}…` : raw;
+	}
+
 	function createLoop(params: {
 		action: ActionType;
 		type?: ScheduleType;
@@ -388,9 +396,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (params.action === "shell" && !(params.command?.trim())) throw new Error("command is required for action 'shell'");
 
 		const id = newId();
+		// Derive a human-readable name from the payload when none is given, so
+		// one-liner creates (`/loop 5m check the build`) are targetable by name.
+		const derivedName = params.name?.trim() || deriveName(params);
 		const loop = store.add(
 			{
-				name: params.name,
+				name: derivedName,
 				action: params.action,
 				type: parsed.type,
 				schedule: parsed.schedule,
@@ -443,43 +454,127 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return new Text(text, 0, 0);
 	});
 
+	// ─── Verb grammar ─────────────────────────────────────────────────────────
+	// First token of `/loop <args>` decides intent:
+	//   control verb (pause/resume/delete/remove/run) → control op
+	//   action verb (prompt/notify/shell/message)      → create with that action
+	//   else                                            → prompt action, schedule-first
+	// Cron schedules contain spaces → quote them: /loop "*/5 * * * *" check the build
+	const ACTION_VERBS = new Set<ActionType>(["prompt", "notify", "shell", "message"]);
+	const CONTROL_VERBS = new Set<string>(["pause", "resume", "delete", "remove", "run"]);
+
+	/** Quote-aware tokenizer: double quotes keep cron expressions (and multi-word payloads) whole. */
+	function tokenize(s: string): string[] {
+		const out: string[] = [];
+		let cur = "";
+		let inQ = false;
+		for (const c of s) {
+			if (c === '"') { inQ = !inQ; continue; }
+			if (!inQ && /\s/.test(c)) { if (cur) { out.push(cur); cur = ""; } continue; }
+			cur += c;
+		}
+		if (cur) out.push(cur);
+		return out;
+	}
+
+	/** Resolve a name/id query to one loop. Empty query targets the sole active loop, if unique. */
+	function resolveQuery(ctx: ExtensionContext, query: string): Loop | undefined {
+		if (query) {
+			const loop = store.find(query);
+			if (!loop) ctx.ui.notify(`No unique loop matching "${query}".`, "warning");
+			return loop;
+		}
+		const visible = store.list().filter((l) => l.status !== "done" && l.status !== "error");
+		if (visible.length === 1) return visible[0];
+		if (visible.length === 0) ctx.ui.notify("No loops to act on.", "warning");
+		else ctx.ui.notify("Multiple loops — specify a name or id.", "warning");
+		return undefined;
+	}
+
+	// Shared control ops — used by both the CLI verbs and the interactive menu.
+	function pauseLoop(loop: Loop, ctx: ExtensionContext) {
+		disarm(loop.id);
+		store.update(loop.id, { enabled: false, status: "paused", nextRun: undefined });
+		void store.persist();
+		updateUI(ctx);
+		ctx.ui.notify(`Paused "${loop.name}"`, "info");
+	}
+	function resumeLoop(loop: Loop, ctx: ExtensionContext) {
+		const updated = store.update(loop.id, { enabled: true, status: "active" })!;
+		arm(updated, ctx);
+		updateUI(ctx);
+		ctx.ui.notify(`Resumed "${loop.name}"`, "info");
+	}
+	function deleteLoop(loop: Loop, ctx: ExtensionContext) {
+		disarm(loop.id);
+		store.remove(loop.id);
+		updateUI(ctx);
+		ctx.ui.notify(`Deleted "${loop.name}"`, "info");
+	}
+	function runLoopNow(loop: Loop, ctx: ExtensionContext) {
+		ctx.ui.notify(`Firing "${loop.name}" now…`, "info");
+		void fire(loop.id, ctx, true); // force: fires even while paused, without un-pausing
+	}
+
+	async function controlLoop(verb: string, query: string, ctx: ExtensionContext) {
+		const loop = resolveQuery(ctx, query);
+		if (!loop) return;
+		if (verb === "pause") return pauseLoop(loop, ctx);
+		if (verb === "resume") {
+			if (loop.enabled) { ctx.ui.notify(`"${loop.name}" is already active`, "info"); return; }
+			return resumeLoop(loop, ctx);
+		}
+		if (verb === "delete" || verb === "remove") return deleteLoop(loop, ctx);
+		if (verb === "run") return runLoopNow(loop, ctx);
+	}
+
 	// ─── Commands ──────────────────────────────────────────────────────────────
 
 	pi.registerCommand("loop", {
-		description: "Create or manage scheduled loops. Usage: /loop [schedule] [prompt]",
+		description: "Create or control scheduled loops. With no args, opens the manager.",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
-			// Quick create: /loop <schedule> <prompt...>
-			if (trimmed) {
-				const firstSpace = trimmed.search(/\s/);
-				if (firstSpace === -1) {
-					ctx.ui.notify("Usage: /loop <schedule> <prompt>", "warning");
-					return;
-				}
-				const schedule = trimmed.slice(0, firstSpace);
-				const prompt = trimmed.slice(firstSpace + 1).trim();
-				if (!prompt) {
-					ctx.ui.notify("Usage: /loop <schedule> <prompt>", "warning");
-					return;
-				}
-				try {
-					const loop = createLoop({ action: "prompt", schedule, prompt }, ctx);
-					ctx.ui.notify(`Created loop "${loop.name}" (${loopScheduleLabel(loop)})`, "info");
-				} catch (err) {
-					ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
-				}
-				return;
+			if (!trimmed) return manage(ctx); // wizard
+
+			const tokens = tokenize(trimmed);
+			const verb = tokens[0].toLowerCase();
+
+			// Control verbs: /loop pause|resume|delete|remove|run [name|id]
+			if (CONTROL_VERBS.has(verb)) {
+				return controlLoop(verb, tokens.slice(1).join(" ").trim(), ctx);
 			}
 
-			// Interactive manager — native dialogs only (no overlay).
-			await manage(ctx);
-		},
-	});
+			// Optional action verb: /loop prompt|notify|shell|message <schedule> <payload>
+			let action: ActionType = "prompt";
+			let rest = trimmed;
+			if (ACTION_VERBS.has(verb as ActionType)) {
+				action = verb as ActionType;
+				rest = tokens.slice(1).join(" ");
+				if (!rest) {
+					ctx.ui.notify(`Usage: /loop ${verb} <schedule> <payload>`, "warning");
+					return;
+				}
+			}
 
-	pi.registerCommand("loops", {
-		description: "List all scheduled loops",
-		handler: async (_args, ctx) => {
-			await listLoops(ctx);
+			// schedule = first remaining token, payload = the rest
+			const restTokens = tokenize(rest);
+			if (restTokens.length < 2) {
+				ctx.ui.notify("Usage: /loop [action] <schedule> <payload>", "warning");
+				return;
+			}
+			const schedule = restTokens[0];
+			const payload = restTokens.slice(1).join(" ");
+
+			try {
+				const params: Parameters<typeof createLoop>[0] = { action, schedule };
+				if (action === "prompt") params.prompt = payload;
+				else if (action === "notify" || action === "message") params.message = payload;
+				else if (action === "shell") params.command = payload;
+				const loop = createLoop(params, ctx);
+				ctx.ui.notify(`Created ${action} loop "${loop.name}" (${loopScheduleLabel(loop)})`, "info");
+			} catch (err) {
+				ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+			}
 		},
 	});
 
@@ -648,42 +743,14 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (!action) return;
 
 		if (action === "Pause") {
-			disarm(loop.id);
-			store.update(loop.id, { enabled: false, status: "paused", nextRun: undefined });
-			void store.persist();
-			updateUI(ctx);
-			ctx.ui.notify(`Paused "${loop.name}"`, "info");
+			pauseLoop(loop, ctx);
 		} else if (action === "Resume") {
-			const updated = store.update(loop.id, { enabled: true, status: "active" })!;
-			arm(updated, ctx);
-			ctx.ui.notify(`Resumed "${loop.name}"`, "info");
+			resumeLoop(loop, ctx);
 		} else if (action === "Run now") {
-			ctx.ui.notify(`Firing "${loop.name}" now…`, "info");
-			void fire(loop.id, ctx);
+			runLoopNow(loop, ctx);
 		} else if (action === "Delete") {
-			disarm(loop.id);
-			store.remove(loop.id);
-			updateUI(ctx);
-			ctx.ui.notify(`Deleted "${loop.name}"`, "info");
+			deleteLoop(loop, ctx);
 		}
-	}
-
-	async function listLoops(ctx: ExtensionContext) {
-		const loops = store.list();
-		if (loops.length === 0) {
-			record(ctx, "No loops scheduled. Use /loop to create one.", {});
-			return;
-		}
-		const lines = ["Loops:"];
-		for (const l of loops) {
-			const next = l.nextRun && l.enabled ? formatRelative(l.nextRun, new Date()) : l.status;
-			const payload = loopPayloadPreview(l);
-			lines.push(
-				`  ${statusGlyph(l)} ${l.id} ${l.name} [${l.action}/${l.type}] ${loopScheduleLabel(l)} next=${next} runs=${l.runCount}${l.lastStatus === "error" ? " last=error" : ""}${payload ? ` :: ${payload}` : ""}`,
-			);
-		}
-		record(ctx, lines.join("\n"), { loops });
-		updateUI(ctx);
 	}
 
 	// ─── Tools (for the LLM to self-schedule) ──────────────────────────────────

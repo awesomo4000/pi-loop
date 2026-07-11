@@ -238,6 +238,8 @@ export function describeSchedule(parsed: ParsedSchedule): string {
 /** Infer schedule type heuristically from a raw string, for the quick-create command. */
 export function inferType(raw: string): ScheduleType {
 	const s = raw.trim();
+	// Explicit relative-one-shot prefixes: "+10m", "in 10 minutes" → once.
+	if (/^[+]/.test(s) || /^in\s+/i.test(s)) return "once";
 	// 5+ field whitespace-separated with digit/*/- → cron
 	if (/^(\S+\s+){3,}\S+$/.test(s) && /[*0-9/,-]/.test(s) && !parseDurationMs(s)) {
 		return "cron";

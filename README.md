@@ -27,39 +27,68 @@ Type this in your pi prompt:
 
 That's it — an interval loop now wakes the agent with *"check the build"* every 5 minutes. The footer shows `🔁 1 loop · next 4m` and a widget below the editor tracks it with a live countdown.
 
-## Creating loops
+## Command grammar
 
-### One-liner (fastest)
-
-```
-/loop <schedule> <prompt>
-```
-
-The prompt becomes the loop **name** (first few words) and the payload. Type is inferred from the schedule.
+Everything is one command. The **first token** decides what happens:
 
 ```
-/loop 30s poll health            # interval
-/loop 1h30m sync the cache       # interval (compound duration)
-/loop +10m review the diff       # once, in 10 minutes
-/loop tomorrow 9am write notes   # once, at a clock time
+/loop                                  wizard (add / list / pause / resume / delete)
+/loop <schedule> <prompt>              quick prompt loop (schedule-first shortcut)
+/loop <action> <schedule> <payload>    explicit action: prompt / notify / shell / message
+/loop <verb> <name|id>                 control: pause / resume / delete / run
 ```
 
-### Interactive wizard — `/loop` with no args
+There's no list command — the widget under the editor (see below) always shows every loop with a live countdown. Pick a loop by name or id for control verbs.
 
-For **cron**, **non-prompt actions**, or to set a **max fire count**, use the wizard:
+### Creating loops
+
+**Schedule-first** (default action = `prompt`):
+
+```
+/loop 5m check the build               # prompt, every 5m
+/loop +10m review the diff             # prompt, once in 10m
+/loop tomorrow 9am write notes         # prompt, once at a clock time
+/loop "*/5 * * * *" poll queue depth   # prompt, cron (quote it — it has spaces)
+```
+
+**Action-first** (any of the four actions):
+
+```
+/loop shell 5m npm test                # run a command every 5m
+/loop notify 9am standup               # reminder toast at 9am
+/loop notify +5m break time            # reminder in 5 minutes
+/loop message 1h heartbeat             # post a transcript line hourly
+/loop prompt 1h sync the cache         # explicit prompt (same as schedule-first)
+```
+
+To wake the agent with a shell command's output, add a `followUpPrompt` — via the wizard or by asking the agent.
+
+**Interactive wizard** — for cron with a follow-up prompt, a custom name, or a max-fire count:
 
 ```
 /loop
 ```
 
-It walks you through, re-prompting on invalid input (you never lose what you already typed):
+Walks you through action → type → schedule → payload → name → max fires, re-prompting on invalid input (you never lose what you already typed).
 
-1. **Action** → Prompt / Notify / Shell / Message
-2. **Schedule type** → Interval / Once / Cron
-3. **Schedule** → `5m`, `+10m`, `tomorrow 9am`, `*/5 * * * *`, …
-4. **Payload** → the prompt text / reminder / command
-5. **Name** → optional, defaults to an id
-6. **Max fires** → optional, stops after N runs (recurring only)
+### Controlling loops
+
+**By name or id — no menu needed:**
+
+```
+/loop pause build-check                # stop firing, keep the loop (resumable)
+/loop resume build-check               # re-arm a paused loop
+/loop run build-check                  # fire immediately, ignoring the schedule
+/loop delete build-check               # permanently remove
+```
+
+Name matching is flexible: full id, id prefix, or unique name. With a single active loop you can even omit the name — `/loop pause` targets it.
+
+**Bulk + browse** via the wizard:
+
+```
+/loop  →  Pause all · Resume all · Clear all · List/manage (pick → Pause/Resume/Run now/Delete)
+```
 
 ### Schedules
 
@@ -68,6 +97,8 @@ It walks you through, re-prompting on invalid input (you never lose what you alr
 | **interval** | `5m`, `1h30m`, `30s`, `2h`, `hourly`, `daily`, `every 10m`, `in 1 hour` |
 | **once** | `+10m`, `in 2 hours`, `tomorrow 9am`, `9am`, `18:30`, `2026-01-01T09:00` |
 | **cron** | `*/5 * * * *` (every 5 min), `0 9 * * 1-5` (9am weekdays), `0 */2 * * *` (every 2h) |
+
+> A leading `+` or `in ` means a one-shot. `5m` / `every …` / bare durations mean interval. Cron is detected from the 5-field shape — **quote it** on the command line since it contains spaces.
 
 ### Actions
 
@@ -78,34 +109,9 @@ It walks you through, re-prompting on invalid input (you never lose what you alr
 | **shell** | runs a command on schedule | `npm test` every 5m; optional `followUpPrompt` wakes the agent with the output |
 | **message** | a line in the transcript | logging, breadcrumbs; optionally triggers a turn |
 
-## Controlling loops
+## See what's running
 
-### Pause / Resume / Delete (one loop)
-
-```
-/loop  →  List / manage…  →  pick a loop  →  Pause · Resume · Run now · Delete
-```
-
-- **Pause** stops the timer but keeps the loop (widget shows `❚❚ paused`). Resumable.
-- **Resume** re-arms a paused loop.
-- **Delete** permanently removes it.
-- **Run now** fires immediately without waiting for the schedule.
-
-### Bulk
-
-From the `/loop` menu:
-
-- **Pause all** — stop every loop
-- **Resume all** — restart every paused loop
-- **Clear all** — permanently remove everything (asks for confirmation)
-
-### See what's running
-
-```
-/loops                          # lists every loop in the transcript
-```
-
-Or just glance at the widget under the editor:
+No command needed — the widget under the editor always shows every loop:
 
 ```
   ● build-check    every 5m         in 4m        ×3   prompt

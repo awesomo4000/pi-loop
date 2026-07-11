@@ -155,14 +155,16 @@ export class LoopStore {
 
 	/** Find by exact id, unique id prefix, or unique case-insensitive name. */
 	find(query: string): Loop | undefined {
-		const q = query.trim();
+		const q = query.trim().toLowerCase();
 		if (!q) return undefined;
-		const byId = this.loops.get(q);
+		const byId = this.loops.get(query.trim());
 		if (byId) return byId;
-		const prefixMatches = this.list().filter((l) => l.id.startsWith(q));
-		if (prefixMatches.length === 1) return prefixMatches[0];
-		const nameMatches = this.list().filter((l) => l.name.toLowerCase() === q.toLowerCase());
-		if (nameMatches.length === 1) return nameMatches[0];
+		const idPrefix = this.list().filter((l) => l.id.toLowerCase().startsWith(q));
+		if (idPrefix.length === 1) return idPrefix[0];
+		const nameExact = this.list().filter((l) => l.name.toLowerCase() === q);
+		if (nameExact.length === 1) return nameExact[0];
+		const namePrefix = this.list().filter((l) => l.name.toLowerCase().startsWith(q));
+		if (namePrefix.length === 1) return namePrefix[0];
 		return undefined;
 	}
 
