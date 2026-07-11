@@ -2,7 +2,7 @@
 
 Scheduled loops for the [Pi](https://github.com/earendil-works/pi-mono) coding agent.
 
-Wake the agent with a prompt, fire a reminder, run a command, or post a message — on an **interval**, **once**, or **cron**. Always-visible status, reliable recurrence, survives restarts.
+Wake the agent with a prompt, fire a reminder, run a command, or post a message — on an **interval**, **once**, or **cron**. Always-visible status, reliable recurrence, survives restarts. Loops coalesce cleanly during long agent runs; prefix `!` to force one to **interrupt mid-run**.
 
 ## Install
 
@@ -30,6 +30,7 @@ Everything is one command. The **first token** decides what happens:
 /loop                                  wizard (add / list / pause / resume / delete)
 /loop <schedule> <prompt>              quick prompt loop (schedule-first shortcut)
 /loop <action> <schedule> <payload>    explicit action: prompt / notify / shell / message
+/loop !<schedule> <prompt>             forced loop — interrupt mid-run if the agent is busy
 /loop <verb> <name|id>                 control: pause / resume / delete / run
 ```
 
@@ -57,6 +58,14 @@ There's no list command — the widget under the editor (see below) always shows
 ```
 
 To wake the agent with a shell command's output, add a `followUpPrompt` — via the wizard or by asking the agent.
+
+**Forced loops (`!`)** — prefix `!` to make a loop **interrupt** the agent mid-run instead of waiting for it to finish (see [When the agent is busy](#when-the-agent-is-busy)):
+
+```
+/loop !5m check ci                     # forced: inject at the next tool-call boundary if busy
+/loop !+10m remind me to review        # forced one-shot
+/loop !shell 1h npm test               # forced shell
+```
 
 **Interactive wizard** — for cron with a follow-up prompt, a custom name, or a max-fire count:
 
@@ -104,22 +113,38 @@ Name matching is flexible: full id, id prefix, or unique name. With a single act
 | **shell** | runs a command on schedule | `npm test` every 5m; optional `followUpPrompt` wakes the agent with the output |
 | **message** | a line in the transcript | logging, breadcrumbs; optionally triggers a turn |
 
+## When the agent is busy
+
+A loop can fire while the agent is mid-run (a long task, a goal skill, a stuck loop of tool calls). Two delivery policies handle this without flooding:
+
+| | Agent idle | Agent busy |
+|---|---|---|
+| **default** | fires immediately | coalesces → **one** delivery when the run **settles** (even if that's an hour away) |
+| **`!` forced** | fires immediately | coalesces per-turn → **steers in at the next tool-call boundary** (lands in seconds) |
+
+- **default** keeps long runs uninterrupted — fires batch up and land once when the agent finishes. Good for background polling ("check CI every 5m").
+- **`!`** is for timely triggers that can't wait — "remind me in 10m", "wake me if health checks fail". It injects between turns, coalesced so a `!5m` loop never bursts (max one injection per turn).
+
+The difference matters when a run drags on: default waits for the end; `!` breaks in at the next opportunity.
+
 ## See what's running
 
 No command needed — the widget under the editor always shows every loop:
 
 ```
-  ● build-check    every 5m         in 4m        ×3   prompt
+  ● build-check    every 5m         in 4m        ×3   prompt !
   ○ standup        cron 0 9 * * 1-5 in 14h       ×0   prompt
   ❚❚ deploys       every 1h         paused       ×12  shell
   ✗ broken-watch   every 30s        errored      ×2   shell
 ```
 
-| Glyph | Meaning |
+| Glyph / marker | Meaning |
 |---|---|
 | `●` | active |
 | `❚❚` | paused |
 | `✗` | errored (last run failed) |
+| `!` | forced loop — interrupts mid-run when busy |
+| `⏳` | a fire is buffered (waiting to deliver) |
 
 Finished loops (a `once` that fired, or one that hit `maxFires`) are removed automatically — the widget shows only loops that still have work to do.
 
@@ -135,6 +160,9 @@ Remind me to review the PR at 9am tomorrow.
 ```
 ```
 Poll /health every 30s and wake me up if it's not 200.
+```
+```
+Schedule a forced loop: remind me in 10 minutes no matter what I'm doing.
 ```
 ```
 pause the build-check loop
