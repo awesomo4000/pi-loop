@@ -17,7 +17,7 @@
 //      never loses the recurrence.
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, type Component, type TUI } from "@earendil-works/pi-tui";
 import { Cron } from "croner";
 import { join } from "node:path";
 import { Type } from "typebox";
@@ -37,7 +37,6 @@ const CONFIG_DIR_NAME = ".pi";
 const MAX_TIMER_DELAY_MS = 2_147_483_647; // setTimeout practical cap (~24.8d)
 const DEFAULT_SHELL_TIMEOUT_MS = 5 * 60_000;
 const MAX_OUTPUT_CHARS = 8_000;
-const UI_TICK_MS = 30_000;
 
 type Handle = { kind: "timeout"; handle: NodeJS.Timeout } | { kind: "cron"; handle: Cron };
 
@@ -66,57 +65,114 @@ function statusGlyph(loop: Loop): string {
 	}
 }
 
+/**
+ * LoopWidget â a self-rendering, self-ticking TUI component.
+ *
+ * State-of-the-art countdown: the factory form of setWidget mounts this ONCE;
+ * render() recomputes lines fresh from the live store each call; an adaptive
+ * timer calls tui.requestRender() (coalesced by the TUI) â never re-calling
+ * setWidget, so no widget teardown/rebuild or flicker. Tick rate scales with
+ * the nearest fire: 1s under a minute out, 30s under an hour, 10m beyond.
+ */
+class LoopWidget implements Component {
+	private timer?: ReturnType<typeof setTimeout>;
+	constructor(
+		private readonly tui: TUI,
+		private readonly getState: () => { lines: string[]; tickMs: number },
+		private readonly onTick: () => void,
+	) {
+		this.scheduleTick();
+	}
+	render(_width: number): string[] {
+		return this.getState().lines;
+	}
+	invalidate() {
+		/* render() is pure â reads live store + Date.now() each call; nothing cached. */
+	}
+	/** Re-render now and reschedule the adaptive tick. Called on mutations. */
+	refresh() {
+		this.scheduleTick();
+		this.tui.requestRender();
+		this.onTick();
+	}
+	private scheduleTick() {
+		if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+		const { tickMs, lines } = this.getState();
+		if (lines.length === 0) return; // nothing to count down â timer stays cleared
+		this.timer = setTimeout(() => {
+			this.tui.requestRender();
+			this.onTick();
+			this.scheduleTick(); // reschedule at the (possibly new) precision
+		}, Math.max(250, tickMs));
+		this.timer.unref?.();
+	}
+	dispose() {
+		if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+	}
+}
+
 export default function loopExtension(pi: ExtensionAPI) {
 	let store = new LoopStore(loopFilePath(process.cwd()));
 	const handles = new Map<string, Handle>();
 	const firing = new Set<string>();
 	let activeCtx: ExtensionContext | undefined;
-	let uiTick: NodeJS.Timeout | undefined;
+	let loopWidget: LoopWidget | undefined;
 
 	// ─── UI ────────────────────────────────────────────────────────────────────
 
 	function updateUI(ctx = activeCtx) {
 		if (!ctx?.hasUI) return;
-		const theme = ctx.ui.theme;
-		const visible = store.list();
-		const active = visible.filter((l) => l.enabled && l.status !== "done" && l.status !== "error");
+		updateFooter(ctx);
+		loopWidget?.refresh();
+	}
 
-		// Footer chip — always visible when loops exist.
+	/** Footer chip: "🔁 N loops · next Xm". Updated on every mutation and widget tick. */
+	function updateFooter(ctx: ExtensionContext) {
+		const theme = ctx.ui.theme;
+		const active = store.list().filter((l) => l.enabled && l.status !== "done" && l.status !== "error");
 		if (active.length === 0) {
 			ctx.ui.setStatus("loop", undefined);
-		} else {
-			const s = active.length === 1 ? "" : "s";
-			const next = earliestNextRun(active);
-			const nextLabel = next ? ` · next ${formatRelative(next, new Date())}` : "";
-			ctx.ui.setStatus(
-				"loop",
-				theme.fg("accent", `🔁 ${active.length} loop${s}`) + theme.fg("dim", nextLabel),
-			);
-		}
-
-		// Widget below the editor — one line per loop, live countdown.
-		if (visible.length === 0) {
-			ctx.ui.setWidget("loop", undefined);
 			return;
 		}
-		const lines: string[] = [];
+		const s = active.length === 1 ? "" : "s";
+		const next = earliestNextRun(active);
+		const nextLabel = next ? ` · next ${formatRelative(next, new Date())}` : "";
+		ctx.ui.setStatus("loop", theme.fg("accent", `🔁 ${active.length} loop${s}`) + theme.fg("dim", nextLabel));
+	}
+
+	/** Build the widget lines fresh — called at render time, so the countdown is always live. */
+	function widgetLines(theme: any): string[] {
+		const visible = store.list();
+		if (visible.length === 0) return [];
 		const sorted = [...visible].sort((a, b) => {
 			const order = { active: 0, paused: 1, error: 2, done: 3 } as const;
 			if (order[a.status] !== order[b.status]) return order[a.status] - order[b.status];
 			return (Date.parse(a.nextRun ?? "") || 0) - (Date.parse(b.nextRun ?? "") || 0);
 		});
+		const lines: string[] = [];
 		for (const l of sorted) {
 			const glyph = theme.fg(l.status === "done" ? "success" : l.status === "error" ? "error" : "accent", statusGlyph(l));
 			const name = l.name.padEnd(14).slice(0, 14);
 			const sched = theme.fg("muted", loopScheduleLabel(l).padEnd(16).slice(0, 16));
-			const nr = l.enabled && l.status !== "done" && l.status !== "error"
+			const live = l.enabled && l.status !== "done" && l.status !== "error";
+			const nr = live
 				? theme.fg("dim", formatRelative(l.nextRun, new Date()).padEnd(12).slice(0, 12))
 				: theme.fg("dim", (l.status === "done" ? "done" : "paused").padEnd(12).slice(0, 12));
 			const runs = theme.fg("dim", `×${l.runCount}`);
 			const act = theme.fg("accent", l.action);
 			lines.push(`  ${glyph} ${name} ${sched} ${nr} ${runs}  ${act}`);
 		}
-		ctx.ui.setWidget("loop", lines, { placement: "belowEditor" });
+		return lines;
+	}
+
+	/** Adaptive tick: 1s when a fire is <1m away, 30s under an hour, 10m beyond. */
+	function computeTickMs(): number {
+		const active = store.list().filter((l) => l.enabled && l.nextRun);
+		if (active.length === 0) return 60_000;
+		const nearest = Math.min(...active.map((l) => Date.parse(l.nextRun!) - Date.now()));
+		if (nearest < 60_000) return 1000;
+		if (nearest < 3_600_000) return 30_000;
+		return 600_000;
 	}
 
 	function earliestNextRun(loops: Loop[]): string | undefined {
@@ -128,20 +184,6 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}
 		return best !== undefined ? new Date(best).toISOString() : undefined;
 	}
-
-	function startTick(ctx: ExtensionContext) {
-		stopTick();
-		uiTick = setInterval(() => updateUI(ctx), UI_TICK_MS);
-		// unref so the tick never keeps the process alive on its own.
-		uiTick.unref?.();
-	}
-	function stopTick() {
-		if (uiTick) {
-			clearInterval(uiTick);
-			uiTick = undefined;
-		}
-	}
-
 	// ─── Scheduling (arm/disarm/reschedule) ────────────────────────────────────
 
 	function disarm(id: string) {
@@ -427,11 +469,28 @@ export default function loopExtension(pi: ExtensionAPI) {
 		await store.load();
 		activeCtx = ctx;
 		rescheduleAll(ctx);
-		startTick(ctx);
+		// Mount the widget ONCE via the factory form. The component reads the live
+		// store at render time and self-ticks adaptively — no more setWidget churn.
+		if (ctx.hasUI) {
+			ctx.ui.setWidget(
+				"loop",
+				(tui, theme) => {
+					loopWidget = new LoopWidget(
+						tui,
+						() => ({ lines: widgetLines(theme), tickMs: computeTickMs() }),
+						() => { if (activeCtx) updateFooter(activeCtx); },
+					);
+					return loopWidget;
+				},
+				{ placement: "belowEditor" },
+			);
+		}
+		updateUI(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		stopTick();
+		loopWidget?.dispose();
+		loopWidget = undefined;
 		disarmAll();
 		await store.persist(); // flush write-through mirror before exit
 		if (ctx.hasUI) {
