@@ -115,6 +115,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 	let store = new LoopStore(loopFilePath(process.cwd()));
 	const handles = new Map<string, Handle>();
 	const firing = new Set<string>();
+	// Fires that happened while the agent was busy. Keyed by loop id, so repeated
+	// fires of the same loop collapse to the latest — drained as ONE consolidated
+	// turn at agent_settled. Prevents the flood of chained followUp turns during
+	// long multi-turn runs (e.g. a goal skill).
+	const pendingFires = new Map<string, { loop: Loop; firedAt: string; prompt: string }>();
 	let activeCtx: ExtensionContext | undefined;
 	let loopWidget: LoopWidget | undefined;
 
@@ -160,7 +165,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 				: theme.fg("dim", (l.status === "done" ? "done" : "paused").padEnd(12).slice(0, 12));
 			const runs = theme.fg("dim", `×${l.runCount}`);
 			const act = theme.fg("accent", l.action);
-			lines.push(`  ${glyph} ${name} ${sched} ${nr} ${runs}  ${act}`);
+			// ⏳ marks loops whose wake is buffered (fired while the agent was busy).
+			const queued = pendingFires.has(l.id) ? " " + theme.fg("warning", "⏳") : "";
+			lines.push(`  ${glyph} ${name} ${sched} ${nr} ${runs}  ${act}${queued}`);
 		}
 		return lines;
 	}
@@ -327,7 +334,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 		if (loop.action === "prompt") {
 			const prompt = buildPromptHeader(loop) + "\n\n" + (loop.prompt || "");
-			sendAgentPrompt(ctx, prompt);
+			sendAgentPrompt(ctx, loop, prompt);
 			return;
 		}
 
@@ -376,7 +383,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 					"",
 					loop.followUpPrompt,
 				].join("\n");
-				sendAgentPrompt(ctx, block);
+				sendAgentPrompt(ctx, loop, block);
 			}
 			return;
 		}
@@ -393,9 +400,28 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return `[Loop "${loop.name || loop.id}" fired · ${loop.action} · ${schedLabel} · run ${runLabel}]`;
 	}
 
-	function sendAgentPrompt(ctx: ExtensionContext, prompt: string) {
-		if (ctx.isIdle()) pi.sendUserMessage(prompt);
-		else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+	function sendAgentPrompt(ctx: ExtensionContext, loop: Loop, prompt: string) {
+		if (ctx.isIdle()) {
+			pi.sendUserMessage(prompt);
+			return;
+		}
+		// Busy: buffer instead of queueing as followUp. Repeated fires of the same
+		// loop overwrite (latest wins), so a 5m loop during a 30m run collapses to
+		// ONE pending entry — drained as a single consolidated turn at agent_settled.
+		pendingFires.set(loop.id, { loop, firedAt: new Date().toISOString(), prompt });
+	}
+
+	/** Drain buffered fires as ONE consolidated user message. Called at agent_settled. */
+	function drainPending(ctx: ExtensionContext) {
+		if (pendingFires.size === 0) return;
+		if (!ctx.isIdle()) return; // another extension started a run; wait for next settle
+		const entries = [...pendingFires.values()];
+		pendingFires.clear();
+		updateUI(ctx);
+		const count = entries.length;
+		const body = entries.map((e) => e.prompt).join("\n\n---\n\n");
+		const consolidated = `[Loops fired while you were busy — ${count} queued, handling now]\n\n${body}`;
+		pi.sendUserMessage(consolidated);
 	}
 
 	function record(ctx: ExtensionContext, content: string, details?: Record<string, unknown>) {
@@ -462,11 +488,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 		return loop;
 	}
 
-	// ─── Lifecycle ─────────────────────────────────────────────────────────────
+	// Drain buffered fires as one consolidated turn when the agent truly settles.
+	// This is the fix for the multi-turn flood: fires that happened while busy
+	// (e.g. during a goal skill) are coalesced here instead of chaining as followUps.
+	pi.on("agent_settled", async (_event, ctx) => {
+		drainPending(ctx);
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		store = new LoopStore(loopFilePath(ctx.cwd));
 		await store.load();
+		pendingFires.clear();
 		activeCtx = ctx;
 		rescheduleAll(ctx);
 		// Mount the widget ONCE via the factory form. The component reads the live
@@ -489,6 +521,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		pendingFires.clear();
 		loopWidget?.dispose();
 		loopWidget = undefined;
 		disarmAll();
