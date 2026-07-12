@@ -23,7 +23,6 @@ import { join } from "node:path";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
-	describeSchedule,
 	inferType,
 	nextRun,
 	validateSchedule,
@@ -336,7 +335,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		}
 
 		if (loop.action === "prompt") {
-			const prompt = buildPromptHeader(loop) + "\n\n" + (loop.prompt || "");
+			const prompt = wrapScheduled(loop.prompt || "");
 			sendAgentPrompt(ctx, loop, prompt);
 			return;
 		}
@@ -368,7 +367,6 @@ export default function loopExtension(pi: ExtensionAPI) {
 			record(ctx, `▣ ${label}: exit ${result.code}`, { loop, result: summary });
 			if (loop.followUpPrompt) {
 				const block = [
-					buildPromptHeader(loop),
 					"A scheduled shell command completed.",
 					"",
 					`Command: \`${loop.command}\``,
@@ -386,7 +384,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 					"",
 					loop.followUpPrompt,
 				].join("\n");
-				sendAgentPrompt(ctx, loop, block);
+				sendAgentPrompt(ctx, loop, wrapScheduled(block));
 			}
 			return;
 		}
@@ -394,13 +392,14 @@ export default function loopExtension(pi: ExtensionAPI) {
 		throw new Error(`Unsupported action: ${loop.action}`);
 	}
 
-	function buildPromptHeader(loop: Loop): string {
-		const parsed = safeParsed(loop);
-		const schedLabel = parsed ? describeSchedule(parsed) : loopScheduleLabel(loop);
-		const run = loop.runCount + 1;
-		const runLabel = loop.maxFires ? `${run}/${loop.maxFires}` : `${run}`;
-		// One compact line — the header is metadata, not the instruction. Don't burn tokens.
-		return `[Loop "${loop.name || loop.id}" fired · ${loop.action} · ${schedLabel} · run ${runLabel}]`;
+	/**
+	 * Wrap a loop's payload so the agent attributes it correctly: an automated
+	 * scheduled trigger, NOT a user message. The tag is the semantic boundary;
+	 * the one sentence is the irreducible attribution fix. Payload carries intent.
+	 * (No metadata/priority/urgency invented — that's for the transcript, not the agent.)
+	 */
+	function wrapScheduled(payload: string): string {
+		return `<scheduled_trigger>\nAutomated scheduled trigger — not a message from the user.\n\n${payload}\n</scheduled_trigger>`;
 	}
 
 	function sendAgentPrompt(ctx: ExtensionContext, loop: Loop, prompt: string) {
