@@ -636,6 +636,95 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (verb === "run") return runLoopNow(loop, ctx);
 	}
 
+	/** Disarm + arm, recomputing nextRun. Used after edits that change scheduling. */
+	function rearm(loop: Loop, ctx: ExtensionContext) {
+		disarm(loop.id);
+		if (loop.enabled && loop.status !== "done" && loop.status !== "error") arm(loop, ctx);
+		updateUI(ctx);
+	}
+
+	/** Interactive field editor — pick a field, change it, loop until Done. */
+	async function editLoop(initial: Loop, ctx: ExtensionContext) {
+		let loop = initial;
+		while (true) {
+			// Snapshot current values so the picker reflects the latest state each loop.
+			const schedLabel = loopScheduleLabel(loop);
+			const payloadLabel = (() => {
+				const raw = (loop.prompt ?? loop.message ?? loop.command ?? "").replace(/\n/g, " ").trim();
+				return raw.length > 30 ? `${raw.slice(0, 27)}…` : raw || "(empty)";
+			})();
+			const fields = [
+				`Schedule       ${schedLabel}`,
+				`Force (!)      ${loop.force ? "on" : "off"}`,
+				`Payload        ${payloadLabel}`,
+				`Name           ${loop.name}`,
+				`Max fires      ${loop.maxFires ? String(loop.maxFires) : "forever"}`,
+				"Done",
+			];
+			const choice = await ctx.ui.select(`Edit ${loop.name}`, fields);
+			if (!choice || choice === "Done") return;
+
+			try {
+				if (choice.startsWith("Schedule")) {
+					const typeChoice = await ctx.ui.select("Schedule type", [
+						`Interval (current: ${loop.type === "interval" ? "yes" : "no"})`,
+						`Once (current: ${loop.type === "once" ? "yes" : "no"})`,
+						`Cron (current: ${loop.type === "cron" ? "yes" : "no"})`,
+					]);
+					if (!typeChoice) continue;
+					const type = typeChoice.split(" ")[0].toLowerCase() as ScheduleType;
+					let ph = "";
+					let schedule = "";
+					while (true) {
+						ph = type === "interval" ? "e.g. 5m, 1h, 30s" : type === "once" ? "e.g. +10m, tomorrow 9am" : "e.g. */5 * * * *";
+						schedule = (await ctx.ui.input(`Schedule (current: ${loop.schedule})`, ph)) ?? "";
+						if (!schedule) { schedule = ""; break; }
+						try { validateSchedule(type, schedule.trim()); schedule = schedule.trim(); break; }
+						catch (e) { ph = e instanceof Error ? e.message : "Invalid schedule"; }
+					}
+					if (schedule) {
+						const parsed = validateSchedule(type, schedule, new Date());
+						const updated = store.update(loop.id, { type: parsed.type, schedule: parsed.schedule, intervalMs: parsed.intervalMs })!;
+						loop = updated;
+						rearm(loop, ctx);
+						ctx.ui.notify(`Schedule → ${loopScheduleLabel(loop)}`, "info");
+					}
+				} else if (choice.startsWith("Force")) {
+					const next = !loop.force;
+					loop = store.update(loop.id, { force: next })!;
+					ctx.ui.notify(`Force ${next ? "on (!)" : "off"}`, "info");
+				} else if (choice.startsWith("Payload")) {
+					const field = loop.action === "shell" ? "command" : loop.action === "notify" || loop.action === "message" ? "message" : "prompt";
+					const title = field === "command" ? "Shell command" : field === "message" ? "Message text" : "Prompt";
+					const edited = await ctx.ui.editor(title, loop[field] ?? "");
+					if (edited === undefined) continue;
+					loop = store.update(loop.id, { [field]: edited } as Partial<Loop>)!;
+					ctx.ui.notify("Payload updated", "info");
+				} else if (choice.startsWith("Name")) {
+					const edited = await ctx.ui.input("Name", loop.name);
+					if (edited === undefined) continue;
+					loop = store.update(loop.id, { name: edited.trim() || loop.name })!;
+					ctx.ui.notify("Name updated", "info");
+				} else if (choice.startsWith("Max fires")) {
+					const raw = await ctx.ui.input("Max fires (empty = forever)", loop.maxFires ? String(loop.maxFires) : "");
+					if (raw === undefined) continue;
+					const n = raw.trim() === "" ? undefined : Number(raw);
+					if (raw.trim() !== "" && (!Number.isInteger(n) || (n as number) <= 0)) {
+						ctx.ui.notify("Max fires must be a positive integer", "warning");
+						continue;
+					}
+					loop = store.update(loop.id, { maxFires: n as number | undefined, runCount: 0 })!;
+					rearm(loop, ctx);
+					ctx.ui.notify(`Max fires → ${n ?? "forever"} (run count reset)`, "info");
+				}
+				void store.persist();
+				updateUI(ctx);
+			} catch (err) {
+				ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+			}
+		}
+	}
+
 	// ─── Commands ──────────────────────────────────────────────────────────────
 
 	pi.registerCommand("loop", {
@@ -861,7 +950,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const opts: string[] = [];
 		if (loop.enabled) opts.push("Pause");
 		else if (loop.status !== "done" && loop.status !== "error") opts.push("Resume");
-		opts.push("Run now", "Delete");
+		opts.push("Run now", "Edit…", "Delete");
 
 		const action = await ctx.ui.select(`${loop.name} (${loopScheduleLabel(loop)})`, opts);
 		if (!action) return;
@@ -872,6 +961,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 			resumeLoop(loop, ctx);
 		} else if (action === "Run now") {
 			runLoopNow(loop, ctx);
+		} else if (action === "Edit…") {
+			await editLoop(loop, ctx);
 		} else if (action === "Delete") {
 			deleteLoop(loop, ctx);
 		}
