@@ -18,7 +18,7 @@ export type LoopStatus = "active" | "paused" | "done" | "error";
 
 export interface Loop {
 	id: string;
-	name: string;
+	name?: string;
 	action: ActionType;
 	type: ScheduleType;
 	/** Normalized schedule expression. */
@@ -164,10 +164,14 @@ export class LoopStore {
 		if (byId) return byId;
 		const idPrefix = this.list().filter((l) => l.id.toLowerCase().startsWith(q));
 		if (idPrefix.length === 1) return idPrefix[0];
-		const nameExact = this.list().filter((l) => l.name.toLowerCase() === q);
+		const named = this.list().filter((l) => l.name !== undefined);
+		const nameExact = named.filter((l) => l.name!.toLowerCase() === q);
 		if (nameExact.length === 1) return nameExact[0];
-		const namePrefix = this.list().filter((l) => l.name.toLowerCase().startsWith(q));
+		const namePrefix = named.filter((l) => l.name!.toLowerCase().startsWith(q));
 		if (namePrefix.length === 1) return namePrefix[0];
+		// Untitled loops: match by payload prefix so `/loop pause <payload-text>` still works.
+		const payloadPrefix = this.list().filter((l) => payloadOf(l).startsWith(q));
+		if (payloadPrefix.length === 1) return payloadPrefix[0];
 		return undefined;
 	}
 
@@ -175,7 +179,7 @@ export class LoopStore {
 		const now = new Date().toISOString();
 		const loop: Loop = {
 			id,
-			name: input.name?.trim() || id,
+			name: input.name?.trim() || undefined,
 			action: input.action,
 			type: input.type,
 			schedule: input.schedule,
@@ -247,6 +251,11 @@ export class LoopStore {
 }
 
 /** Coerce a raw persisted object into a valid Loop, or drop it. */
+function payloadOf(loop: Loop): string {
+	return (loop.prompt ?? loop.message ?? loop.command ?? "").replace(/\n/g, " ").trim().toLowerCase();
+}
+
+
 function normalizeLoop(raw: unknown): Loop | undefined {
 	if (!raw || typeof raw !== "object") return undefined;
 	const r = raw as Record<string, unknown>;
@@ -259,7 +268,7 @@ function normalizeLoop(raw: unknown): Loop | undefined {
 	const status = statuses.includes(r.status as LoopStatus) ? (r.status as LoopStatus) : "active";
 	return {
 		id: r.id,
-		name: typeof r.name === "string" ? r.name : r.id,
+		name: typeof r.name === "string" && r.name.trim() ? r.name : undefined,
 		action,
 		type,
 		schedule: r.schedule,

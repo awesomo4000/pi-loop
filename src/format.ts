@@ -62,3 +62,13 @@ export function loopPayloadPreview(loop: Loop): string {
 	const oneLine = raw.replace(/\n/g, " ").trim();
 	return oneLine.length > 60 ? `${oneLine.slice(0, 57)}…` : oneLine;
 }
+
+/** The full payload as a single line (no truncation) — for flex slots that apply their own width cap. */
+export function loopPayloadRaw(loop: Loop): string {
+	return (loop.prompt ?? loop.message ?? loop.command ?? "").replace(/\n/g, " ").trim();
+}
+
+/** Display label: user-set title, else payload snippet, else id. Never empty. */
+export function displayName(loop: Loop): string {
+	return loop.name || loopPayloadPreview(loop) || loop.id;
+}

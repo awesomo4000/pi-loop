@@ -1,5 +1,5 @@
 node_modules/
-.pi/loops.json
+.pi/
 *.tsbuildinfo
 
 # secrets — never commit

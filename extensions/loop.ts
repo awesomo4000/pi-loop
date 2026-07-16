@@ -17,7 +17,7 @@
 //      never loses the recurrence.
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text, type Component, type TUI } from "@earendil-works/pi-tui";
+import { Text, type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Cron } from "croner";
 import { join } from "node:path";
 import { Type } from "typebox";
@@ -30,7 +30,8 @@ import {
 	type ScheduleType,
 } from "../src/schedule.ts";
 import { LoopStore, newId, planFire, type Loop } from "../src/store.ts";
-import { formatRelative, loopPayloadPreview, loopScheduleLabel, safeParsed } from "../src/format.ts";
+import { getSettings, loadSettings, saveSettings, DEFAULT_SETTINGS, type RenderSettings, type FooterStyle } from "../src/settings.ts";
+import { formatRelative, loopPayloadPreview, loopPayloadRaw, loopScheduleLabel, safeParsed, displayName } from "../src/format.ts";
 
 const CONFIG_DIR_NAME = ".pi";
 const MAX_TIMER_DELAY_MS = 2_147_483_647; // setTimeout practical cap (~24.8d)
@@ -75,18 +76,21 @@ function statusGlyph(loop: Loop): string {
  */
 class LoopWidget implements Component {
 	private timer?: ReturnType<typeof setTimeout>;
+	private lastWidth = 80;
 	constructor(
 		private readonly tui: TUI,
-		private readonly getState: () => { lines: string[]; tickMs: number },
+		private readonly getLines: (width: number) => string[],
+		private readonly getTickMs: () => number,
 		private readonly onTick: () => void,
 	) {
 		this.scheduleTick();
 	}
-	render(_width: number): string[] {
-		return this.getState().lines;
+	render(width: number): string[] {
+		this.lastWidth = width || this.lastWidth;
+		return this.getLines(this.lastWidth);
 	}
 	invalidate() {
-		/* render() is pure â reads live store + Date.now() each call; nothing cached. */
+		/* render() is pure: reads live store + Date.now() each call; nothing cached. */
 	}
 	/** Re-render now and reschedule the adaptive tick. Called on mutations. */
 	refresh() {
@@ -96,13 +100,13 @@ class LoopWidget implements Component {
 	}
 	private scheduleTick() {
 		if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
-		const { tickMs, lines } = this.getState();
-		if (lines.length === 0) return; // nothing to count down â timer stays cleared
+		const lines = this.getLines(this.lastWidth);
+		if (lines.length === 0) return; // nothing to count down -> timer stays cleared
 		this.timer = setTimeout(() => {
 			this.tui.requestRender();
 			this.onTick();
-			this.scheduleTick(); // reschedule at the (possibly new) precision
-		}, Math.max(250, tickMs));
+			this.scheduleTick();
+		}, Math.max(250, this.getTickMs()));
 		this.timer.unref?.();
 	}
 	dispose() {
@@ -122,15 +126,32 @@ export default function loopExtension(pi: ExtensionAPI) {
 	// Per-turn steer coalesce flag: at most one steer per turn window so a forced
 	// (!) loop never bursts. Reset on turn_end.
 	let steeredThisTurn = false;
+	// Debounce timer for idle-state delivery: collects burst fires (e.g. many loops
+	// created with the same interval firing in lockstep) into ONE consolidated
+	// delivery. Fixes the flood where each fire saw isIdle()=true and sent immediately.
+	let idleFlushTimer: ReturnType<typeof setTimeout> | undefined;
+	const IDLE_FLUSH_MS = 50;
 	let activeCtx: ExtensionContext | undefined;
 	let loopWidget: LoopWidget | undefined;
+	// Captured at widget mount so updateUI can force a render even if the widget
+	// component hasn't been instantiated yet (otherwise setStatus wouldn't paint).
+	let tuiRef: TUI | undefined;
+	/** Render settings (user-global). Mutated via the Settings menu. */
+	function widgetConfig(): RenderSettings {
+		return getSettings();
+	}
+	function setWidgetConfig(cfg: RenderSettings) {
+		void saveSettings(cfg);
+		if (activeCtx) updateUI(activeCtx);
+	}
 
 	// ─── UI ────────────────────────────────────────────────────────────────────
 
 	function updateUI(ctx = activeCtx) {
 		if (!ctx?.hasUI) return;
 		updateFooter(ctx);
-		loopWidget?.refresh();
+		if (loopWidget) loopWidget.refresh();
+		else tuiRef?.requestRender(); // ensure the footer status paints even before the widget mounts
 	}
 
 	/** Footer chip: "🔁 N loops · next Xm". Updated on every mutation and widget tick. */
@@ -141,16 +162,25 @@ export default function loopExtension(pi: ExtensionAPI) {
 			ctx.ui.setStatus("loop", undefined);
 			return;
 		}
-		const s = active.length === 1 ? "" : "s";
 		const next = earliestNextRun(active);
-		const nextLabel = next ? ` · next ${formatRelative(next, new Date())}` : "";
-		ctx.ui.setStatus("loop", theme.fg("accent", `🔁 ${active.length} loop${s}`) + theme.fg("dim", nextLabel));
+		const rel = next ? formatRelative(next, new Date()) : "";
+		const cfg = widgetConfig();
+		const chip = cfg.footerStyle === "verbose"
+			? `🔁 ${active.length} loop${active.length === 1 ? "" : "s"}${rel ? ` · next ${rel}` : ""}`
+			: `🔁 ${active.length}${rel ? ` · ${rel}` : ""}`;
+		ctx.ui.setStatus("loop", theme.fg("accent", chip));
 	}
 
-	/** Build the widget lines fresh — called at render time, so the countdown is always live. */
-	function widgetLines(theme: any): string[] {
+	/** Widget lines, laid out the Pi way (cf. custom-footer): fixed metadata columns +
+	 * a flex title/payload slot that absorbs the remaining width. ANSI-aware via
+	 * visibleWidth/truncateToWidth. Width is capped to widthPct of the terminal so the
+	 * widget sits left-aligned and doesn't stretch across very wide terminals. */
+	function widgetLines(theme: any, width: number): string[] {
 		const visible = store.list();
 		if (visible.length === 0) return [];
+		const cfg = widgetConfig();
+		// Cap width: widthPct of terminal, floored at 50 so narrow terminals stay usable.
+		const w = Math.min(width, Math.max(50, Math.round(width * cfg.widthPct / 100)));
 		const sorted = [...visible].sort((a, b) => {
 			const order = { active: 0, paused: 1, error: 2, done: 3 } as const;
 			if (order[a.status] !== order[b.status]) return order[a.status] - order[b.status];
@@ -158,18 +188,33 @@ export default function loopExtension(pi: ExtensionAPI) {
 		});
 		const lines: string[] = [];
 		for (const l of sorted) {
-			const glyph = theme.fg(l.status === "done" ? "success" : l.status === "error" ? "error" : "accent", statusGlyph(l));
-			const name = l.name.padEnd(14).slice(0, 14);
-			const sched = theme.fg("muted", loopScheduleLabel(l).padEnd(16).slice(0, 16));
+			const glyphColor = l.status === "done" ? "success" : l.status === "error" ? "error" : "accent";
+			const glyph = theme.fg(glyphColor, statusGlyph(l));
 			const live = l.enabled && l.status !== "done" && l.status !== "error";
-			const nr = live
-				? theme.fg("dim", formatRelative(l.nextRun, new Date()).padEnd(12).slice(0, 12))
-				: theme.fg("dim", (l.status === "done" ? "done" : "paused").padEnd(12).slice(0, 12));
-			const runs = theme.fg("dim", `×${l.runCount}`);
-			const act = theme.fg("accent", l.action);
-			// `!` marks forced loops (steer mid-run when busy); ⏳ marks a buffered fire.
-			const mark = (l.force ? " " + theme.fg("warning", "!") : "") + (pendingFires.has(l.id) ? " " + theme.fg("warning", "⏳") : "");
-			lines.push(`  ${glyph} ${name} ${sched} ${nr} ${runs}  ${act}${mark}`);
+			const nrText = live ? formatRelative(l.nextRun, new Date()) : (l.status === "done" ? "done" : "paused");
+
+			// Fixed metadata segments (plain text; themed after measuring). Hidden columns drop out.
+			const metaParts: string[] = [];
+			if (cfg.schedule) metaParts.push(loopScheduleLabel(l));
+			if (cfg.countdown) metaParts.push(nrText);
+			if (cfg.runs) metaParts.push(`×${l.runCount}`);
+			if (cfg.action) metaParts.push(l.action);
+			const metaPlain = metaParts.join("  ");
+			const metaThemed = theme.fg("dim", metaPlain);
+
+			// Marks: ! (forced) + ⏳ (buffered). Themed.
+			const markThemed = (l.force ? " " + theme.fg("warning", "!") : "") + (pendingFires.has(l.id) ? " " + theme.fg("warning", "⏳") : "");
+
+			// Title/payload flex slot = whatever width remains.
+			const indent = 2;
+			const fixed = indent + visibleWidth(glyph) + 1 + visibleWidth(metaThemed) + 1 + visibleWidth(markThemed);
+			const flex = Math.max(10, w - fixed);
+			const slotPlain = loopPayloadRaw(l) || "(no payload)";
+			const title = l.name ? truncateToWidth(l.name, flex, "…", true) : truncateToWidth(slotPlain, flex, "…", true);
+			const slotThemed = theme.fg("accent", title);
+
+			const raw = `${" ".repeat(indent)}${glyph} ${slotThemed} ${metaThemed}${markThemed}`;
+			lines.push(truncateToWidth(raw, w));
 		}
 		return lines;
 	}
@@ -301,7 +346,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			} catch (err) {
 				ok = false;
 				errMsg = err instanceof Error ? err.message : String(err);
-				record(ctx, `â  Loop "${loop.name || loop.id}" failed: ${errMsg}`, { loop, error: errMsg });
+				record(ctx, `â  Loop "${displayName(loop)}" failed: ${errMsg}`, { loop, error: errMsg });
 			}
 
 			// Finalize state.
@@ -325,7 +370,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	async function executeAction(loop: Loop, ctx: ExtensionContext): Promise<void> {
-		const label = loop.name || loop.id;
+		const label = displayName(loop);
 
 		if (loop.action === "notify") {
 			const message = loop.message || `🔔 ${label}`;
@@ -403,14 +448,26 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	function sendAgentPrompt(ctx: ExtensionContext, loop: Loop, prompt: string) {
-		if (ctx.isIdle()) {
-			pi.sendUserMessage(prompt);
+		// ALWAYS buffer (keyed by loop id → repeated fires of the same loop coalesce).
+		pendingFires.set(loop.id, { loop, firedAt: new Date().toISOString(), prompt, force: !!loop.force });
+		updateUI(ctx);
+		if (loop.force) {
+			maybeSteer(ctx); // forced (!): steer at the next tool-call boundary
 			return;
 		}
-		// Busy. Buffer (coalesced per loop). force (!) loops steer at the next
-		// tool-call boundary; default loops defer to agent_settled.
-		pendingFires.set(loop.id, { loop, firedAt: new Date().toISOString(), prompt, force: !!loop.force });
-		if (loop.force) maybeSteer(ctx);
+		// Default: deliver consolidated. If busy, agent_settled drains; if idle, a tiny
+		// debounce collects burst fires into ONE delivery instead of N (the lockstep race).
+		scheduleIdleFlush(ctx);
+	}
+
+	/** Collect burst fires into one consolidated delivery when idle. */
+	function scheduleIdleFlush(ctx: ExtensionContext) {
+		if (idleFlushTimer) return; // already scheduled — siblings join this flush
+		idleFlushTimer = setTimeout(() => {
+			idleFlushTimer = undefined;
+			if (ctx.isIdle()) drainPending(ctx); // else: leave buffered for agent_settled
+		}, IDLE_FLUSH_MS);
+		idleFlushTimer.unref?.();
 	}
 
 	/** Coalesced steer for forced (!) loops: at most one steer per turn window. */
@@ -442,13 +499,6 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	// ─── Create helper ─────────────────────────────────────────────────────────
 
-	/** Derive a short loop name from the payload when no explicit name is set. */
-	function deriveName(params: { prompt?: string; message?: string; command?: string }): string | undefined {
-		const raw = (params.prompt ?? params.message ?? params.command ?? "").replace(/\s+/g, " ").trim();
-		if (!raw) return undefined;
-		return raw.length > 40 ? `${raw.slice(0, 37)}…` : raw;
-	}
-
 	function createLoop(params: {
 		action: ActionType;
 		type?: ScheduleType;
@@ -473,13 +523,23 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (params.action === "message" && !(params.message?.trim())) throw new Error("message is required for action 'message'");
 		if (params.action === "shell" && !(params.command?.trim())) throw new Error("command is required for action 'shell'");
 
+		// Defense-in-depth: a very short interval with no maxFires is almost always a
+		// test/spam footgun (fires forever, rapidly). Warn — don't block.
+		if (parsed.intervalMs !== undefined && parsed.intervalMs < 10_000 && params.maxFires === undefined) {
+			ctx.ui.notify(
+				`Interval ${params.schedule} has no maxFires — it will fire rapidly forever. Set maxFires or use a longer interval.`,
+				"warning",
+			);
+		}
+
 		const id = newId();
 		// Derive a human-readable name from the payload when none is given, so
 		// one-liner creates (`/loop 5m check the build`) are targetable by name.
-		const derivedName = params.name?.trim() || deriveName(params);
+		// name is opt-in: undefined unless the user set a title. Display falls back to payload.
+		const name = params.name?.trim() || undefined;
 		const loop = store.add(
 			{
-				name: derivedName,
+				name,
 				action: params.action,
 				type: parsed.type,
 				schedule: parsed.schedule,
@@ -507,6 +567,29 @@ export default function loopExtension(pi: ExtensionAPI) {
 		steeredThisTurn = false;
 	});
 
+	// SOTA policy block (XML + rule-triples + banned behaviors), injected ONLY when
+	// loops exist — zero token cost otherwise. Honest enforcement mapping: R1/R2 are
+	// code-enforced (concurrent fires coalesce; maxFires auto-removes); R3/R4 are prose
+	// only (we can't refuse a tool call) and marked as such — no fake gates.
+	pi.on("before_agent_start", async (event, ctx) => {
+		if (store.list().length === 0) return; // nothing to govern
+		const policy = `
+<loop_policy authority="schedule_loop / stop_loop / list_loops usage">
+  <bannedBehaviors>
+  - Do NOT create multiple loops with the same interval for one goal. Use ONE interval loop with maxFires.
+  - Do NOT create a polling loop without maxFires — it runs forever.
+  - Do NOT use action='prompt' when notify or message would suffice.
+  </bannedBehaviors>
+  <rules>
+  R1 lockstep: invariant ≤ one loop per periodic goal | enforced: concurrent fires coalesce (code) | recovery: stop_loop the duplicates, keep one with maxFires.
+  R2 bounded: invariant every polling loop ends | enforced: maxFires auto-removes the loop (code) | recovery: set maxFires; stop_loop orphans.
+  R3 action-fit: invariant do not wake the agent needlessly | enforced: none (prose) | recovery: switch prompt → notify (reminder) or message (log).
+  R4 force: invariant force=true only for time-sensitive triggers | enforced: none (prose) | recovery: leave force unset.
+  </rules>
+</loop_policy>`;
+		return { systemPrompt: `${event.systemPrompt}\n\n${policy}` };
+	});
+
 	// Drain buffered (default-deferred) fires as one consolidated turn when the
 	// agent truly settles. Forced (!) loops are steered mid-run (see maybeSteer).
 	pi.on("agent_settled", async (_event, ctx) => {
@@ -517,7 +600,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		store = new LoopStore(loopFilePath(ctx.cwd));
 		await store.load();
+		await loadSettings();
 		pendingFires.clear();
+		if (idleFlushTimer) { clearTimeout(idleFlushTimer); idleFlushTimer = undefined; }
 		activeCtx = ctx;
 		rescheduleAll(ctx);
 		// Mount the widget ONCE via the factory form. The component reads the live
@@ -526,9 +611,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 			ctx.ui.setWidget(
 				"loop",
 				(tui, theme) => {
+					tuiRef = tui;
 					loopWidget = new LoopWidget(
 						tui,
-						() => ({ lines: widgetLines(theme), tickMs: computeTickMs() }),
+						(width) => widgetLines(theme, width),
+						() => computeTickMs(),
 						() => { if (activeCtx) updateFooter(activeCtx); },
 					);
 					return loopWidget;
@@ -605,22 +692,22 @@ export default function loopExtension(pi: ExtensionAPI) {
 		store.update(loop.id, { enabled: false, status: "paused", nextRun: undefined });
 		void store.persist();
 		updateUI(ctx);
-		ctx.ui.notify(`Paused "${loop.name}"`, "info");
+		ctx.ui.notify(`Paused "${displayName(loop)}"`, "info");
 	}
 	function resumeLoop(loop: Loop, ctx: ExtensionContext) {
 		const updated = store.update(loop.id, { enabled: true, status: "active" })!;
 		arm(updated, ctx);
 		updateUI(ctx);
-		ctx.ui.notify(`Resumed "${loop.name}"`, "info");
+		ctx.ui.notify(`Resumed "${displayName(loop)}"`, "info");
 	}
 	function deleteLoop(loop: Loop, ctx: ExtensionContext) {
 		disarm(loop.id);
 		store.remove(loop.id);
 		updateUI(ctx);
-		ctx.ui.notify(`Deleted "${loop.name}"`, "info");
+		ctx.ui.notify(`Deleted "${displayName(loop)}"`, "info");
 	}
 	function runLoopNow(loop: Loop, ctx: ExtensionContext) {
-		ctx.ui.notify(`Firing "${loop.name}" now…`, "info");
+		ctx.ui.notify(`Firing "${displayName(loop)}" now…`, "info");
 		void fire(loop.id, ctx, true); // manual: fires even while paused, without un-pausing
 	}
 
@@ -629,7 +716,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (!loop) return;
 		if (verb === "pause") return pauseLoop(loop, ctx);
 		if (verb === "resume") {
-			if (loop.enabled) { ctx.ui.notify(`"${loop.name}" is already active`, "info"); return; }
+			if (loop.enabled) { ctx.ui.notify(`"${displayName(loop)}" is already active`, "info"); return; }
 			return resumeLoop(loop, ctx);
 		}
 		if (verb === "delete" || verb === "remove") return deleteLoop(loop, ctx);
@@ -657,11 +744,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 				`Schedule       ${schedLabel}`,
 				`Force (!)      ${loop.force ? "on" : "off"}`,
 				`Payload        ${payloadLabel}`,
-				`Name           ${loop.name}`,
+				`Name           ${loop.name ?? "(none)"}`,
 				`Max fires      ${loop.maxFires ? String(loop.maxFires) : "forever"}`,
 				"Done",
 			];
-			const choice = await ctx.ui.select(`Edit ${loop.name}`, fields);
+			const choice = await ctx.ui.select(`Edit ${displayName(loop)}`, fields);
 			if (!choice || choice === "Done") return;
 
 			try {
@@ -701,9 +788,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 					loop = store.update(loop.id, { [field]: edited } as Partial<Loop>)!;
 					ctx.ui.notify("Payload updated", "info");
 				} else if (choice.startsWith("Name")) {
-					const edited = await ctx.ui.input("Name", loop.name);
+					const edited = await ctx.ui.input("Name", loop.name ?? "");
 					if (edited === undefined) continue;
-					loop = store.update(loop.id, { name: edited.trim() || loop.name })!;
+					loop = store.update(loop.id, { name: edited.trim() || undefined })!;
 					ctx.ui.notify("Name updated", "info");
 				} else if (choice.startsWith("Max fires")) {
 					const raw = await ctx.ui.input("Max fires (empty = forever)", loop.maxFires ? String(loop.maxFires) : "");
@@ -774,7 +861,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 				else if (action === "notify" || action === "message") params.message = payload;
 				else if (action === "shell") params.command = payload;
 				const loop = createLoop(params, ctx);
-				ctx.ui.notify(`Created ${action} loop "${loop.name}" (${loopScheduleLabel(loop)})${force ? " [forced]" : ""}`, "info");
+				ctx.ui.notify(`Created ${action} loop "${displayName(loop)}" (${loopScheduleLabel(loop)})${force ? " [forced]" : ""}`, "info");
 			} catch (err) {
 				ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
 			}
@@ -782,10 +869,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 	});
 
 	async function manage(ctx: ExtensionContext) {
-		const choice = await ctx.ui.select("Loops", ["Add a loop…", "List / manage…", "Pause all", "Resume all", "Clear all"]);
+		const choice = await ctx.ui.select("Loops", ["Add a loop…", "List / manage…", "Settings…", "Pause all", "Resume all", "Clear all"]);
 		if (!choice) return;
 		if (choice === "Add a loop…") return addLoop(ctx);
 		if (choice === "List / manage…") return manageOne(ctx);
+		if (choice === "Settings…") return widgetSettings(ctx);
 		if (choice === "Pause all") {
 			for (const l of store.list()) {
 				if (l.enabled) {
@@ -918,9 +1006,44 @@ export default function loopExtension(pi: ExtensionAPI) {
 				{ action, type, schedule, name, prompt, message, command, followUpPrompt, maxFires, force },
 				ctx,
 			);
-			ctx.ui.notify(`Created loop "${loop.name}" (${loopScheduleLabel(loop)})`, "info");
+			ctx.ui.notify(`Created loop "${displayName(loop)}" (${loopScheduleLabel(loop)})`, "info");
 		} catch (err) {
 			ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+		}
+	}
+
+	/** Render settings (user-global): width, footer style, column toggles. */
+	async function widgetSettings(ctx: ExtensionContext) {
+		const cfg = { ...widgetConfig() };
+		const cols: Array<["schedule" | "countdown" | "runs" | "action", string]> = [
+			["schedule", "Schedule"],
+			["countdown", "Countdown"],
+			["runs", "Run count"],
+			["action", "Action"],
+		];
+		while (true) {
+			const items: string[] = [];
+			items.push(`Width: ${cfg.widthPct}% of terminal`);
+			items.push(`Footer: ${cfg.footerStyle}`);
+			for (const [k, label] of cols) items.push(`${label}: ${cfg[k] ? "shown" : "hidden"}`);
+			items.push("Back");
+			const choice = await ctx.ui.select("Loop rendering (user-global)", items);
+			if (!choice || choice === "Back") return;
+			if (choice.startsWith("Width:")) {
+				const raw = await ctx.ui.input("Widget width (% of terminal, 1-100)", String(cfg.widthPct));
+				if (raw === undefined) continue;
+				const n = Number(raw);
+				if (Number.isInteger(n) && n >= 1 && n <= 100) { cfg.widthPct = n; setWidgetConfig(cfg); }
+				else ctx.ui.notify("Width must be an integer 1-100", "warning");
+				continue;
+			}
+			if (choice.startsWith("Footer:")) {
+				cfg.footerStyle = cfg.footerStyle === "compact" ? "verbose" : "compact";
+				setWidgetConfig(cfg);
+				continue;
+			}
+			const hit = cols.find(([k, label]) => choice.startsWith(label));
+			if (hit) { cfg[hit[0]] = !cfg[hit[0]]; setWidgetConfig(cfg); }
 		}
 	}
 
@@ -938,7 +1061,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const next = l.nextRun && l.enabled ? formatRelative(l.nextRun, new Date()) : l.status;
 			const preview = loopPayloadPreview(l);
 			const shortId = l.id.slice(0, 12);
-			const label = `${glyph} ${l.name} [${shortId}] ${loopScheduleLabel(l)} · ${next} · ×${l.runCount} · ${l.action}${preview ? ` :: ${preview}` : ""}`;
+			const label = `${glyph} ${displayName(l)} [${shortId}] ${loopScheduleLabel(l)} · ${next} · ×${l.runCount} · ${l.action}${preview ? ` :: ${preview}` : ""}`;
 			labelToId.set(label, l.id);
 			return label;
 		});
@@ -952,7 +1075,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		else if (loop.status !== "done" && loop.status !== "error") opts.push("Resume");
 		opts.push("Run now", "Edit…", "Delete");
 
-		const action = await ctx.ui.select(`${loop.name} (${loopScheduleLabel(loop)})`, opts);
+		const action = await ctx.ui.select(`${displayName(loop)} (${loopScheduleLabel(loop)})`, opts);
 		if (!action) return;
 
 		if (action === "Pause") {
@@ -977,9 +1100,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 			"Schedule a recurring or one-shot loop in this Pi session that can wake the agent with a prompt, run a shell command, post a message, or notify the user. Persists across restarts. Shows in the status bar.",
 		promptSnippet: "Schedule a recurring or one-shot loop (prompt/notify/shell/message) on a timer or cron",
 		promptGuidelines: [
-			"Use schedule_loop when the user asks to do something periodically or later — 'check CI every 5 min', 'remind me at 9am', 'poll the build'.",
-			"Use type='interval' for durations (5m, 1h), type='once' for one-shot ('+10m', 'tomorrow 9am'), type='cron' for cron expressions ('*/5 * * * *').",
-			"For bounded polling, set maxFires so interval loops don't run forever.",
+			"Use schedule_loop for periodic or deferred work — 'check CI every 5 min', 'remind me at 9am', 'poll until the build passes', 'run npm test hourly'.",
+			"Do NOT create schedule_loop calls to test, experiment with, or demonstrate the tool — only create loops for real work the user explicitly asked for. Avoid intervals shorter than ~30s; they fire rapidly and create noise.",
+			"Do NOT create multiple schedule_loop calls with the same interval for one goal — they fire in lockstep and flood the session. Instead create ONE interval loop with maxFires.",
+			"Do NOT use action='prompt' when no agent action is needed — use 'notify' (a silent reminder) or 'message' (a transcript log line). Use 'shell'+followUpPrompt to run a command on a schedule without waking the agent to run it.",
+			"Always set schedule_loop maxFires for polling so it stops itself; a loop without maxFires runs forever. Call stop_loop to remove a loop once its purpose is done.",
+			"Set schedule_loop force=true ONLY for time-sensitive triggers that must interrupt a running task; otherwise leave it unset — the default defers until the agent finishes, avoiding disruption.",
+			"Name loops you create (schedule_loop name) and call list_loops before creating, to avoid duplicates and so stop_loop can target them.",
 		],
 		parameters: Type.Object({
 			action: StringEnum(["prompt", "notify", "shell", "message"] as const, {
@@ -1016,7 +1143,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const loop = createLoop(params as Parameters<typeof createLoop>[0], ctx);
 			return {
-				content: [{ type: "text", text: `Created loop "${loop.name}" (${loopScheduleLabel(loop)}, ${loop.action}). id=${loop.id}` }],
+				content: [{ type: "text", text: `Created loop "${displayName(loop)}" (${loopScheduleLabel(loop)}, ${loop.action}). id=${loop.id}` }],
 				details: { loop },
 			};
 		},
@@ -1045,7 +1172,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			}
 			const lines = loops.map((l) => {
 				const next = l.nextRun && l.enabled ? formatRelative(l.nextRun, new Date()) : l.status;
-				return `- ${l.id} ${l.name} [${l.action}/${l.type}] ${loopScheduleLabel(l)} next=${next} runs=${l.runCount}${l.lastStatus === "error" ? " last=error" : ""}`;
+				return `- ${l.id} ${displayName(l)} [${l.action}/${l.type}] ${loopScheduleLabel(l)} next=${next} runs=${l.runCount}${l.lastStatus === "error" ? " last=error" : ""}`;
 			});
 			return {
 				content: [{ type: "text", text: `${loops.length} loop(s):\n${lines.join("\n")}` }],
@@ -1069,13 +1196,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 				disarm(loop.id);
 				store.remove(loop.id);
 				updateUI(ctx);
-				return { content: [{ type: "text", text: `Deleted loop "${loop.name}".` }], details: { loop } };
+				return { content: [{ type: "text", text: `Deleted loop "${displayName(loop)}".` }], details: { loop } };
 			}
 			disarm(loop.id);
 			store.update(loop.id, { enabled: false, status: "paused", nextRun: undefined });
 			void store.persist();
 			updateUI(ctx);
-			return { content: [{ type: "text", text: `Paused loop "${loop.name}".` }], details: { loop } };
+			return { content: [{ type: "text", text: `Paused loop "${displayName(loop)}".` }], details: { loop } };
 		},
 	});
 }
