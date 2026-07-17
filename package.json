@@ -1,6 +1,6 @@
 {
   "name": "@davidroman/pi-loop",
-  "version": "0.3.5",
+  "version": "0.4.0",
   "description": "Reliable scheduled loops for the Pi coding agent — prompt/notify/shell/message on interval, once, or cron. Always-visible status, working input, bulletproof recurrence.",
   "license": "MIT",
   "author": "davidroman0O",
@@ -17,6 +17,10 @@
   ],
   "type": "module",
   "main": "extensions/loop.ts",
+  "scripts": {
+    "test": "node --import tsx test/check.mjs && node --import tsx test/extension-check.mjs",
+    "check": "tsc --noEmit && npm test"
+  },
   "files": [
     "extensions/",
     "src/",
@@ -32,6 +36,11 @@
   },
   "dependencies": {
     "croner": "^10.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

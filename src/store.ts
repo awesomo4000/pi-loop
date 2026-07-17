@@ -15,6 +15,7 @@ import { dirname } from "node:path";
 import { nextRun, validateSchedule, type ActionType, type ScheduleType } from "./schedule.ts";
 
 export type LoopStatus = "active" | "paused" | "done" | "error";
+export type ShellMode = "notify-output" | "quiet" | "verbose";
 
 export interface Loop {
 	id: string;
@@ -31,6 +32,8 @@ export interface Loop {
 	command?: string;
 	cwd?: string;
 	timeoutMs?: number;
+	/** Shell reporting. Default notify-output: silent checks, notify only for non-empty stdout. */
+	shellMode?: ShellMode;
 	/** Shell: wake the agent with this prompt + command output after it runs. */
 	followUpPrompt?: string;
 	/** Message action: whether to trigger an agent turn. Default true. */
@@ -66,6 +69,7 @@ export interface NewLoopInput {
 	command?: string;
 	cwd?: string;
 	timeoutMs?: number;
+	shellMode?: ShellMode;
 	followUpPrompt?: string;
 	triggerTurn?: boolean;
 	force?: boolean;
@@ -189,6 +193,7 @@ export class LoopStore {
 			command: input.command,
 			cwd: input.cwd,
 			timeoutMs: input.timeoutMs,
+			shellMode: input.shellMode,
 			followUpPrompt: input.followUpPrompt,
 			triggerTurn: input.triggerTurn,
 			force: input.force,
@@ -266,6 +271,7 @@ function normalizeLoop(raw: unknown): Loop | undefined {
 	const type = types.includes(r.type as ScheduleType) ? (r.type as ScheduleType) : "interval";
 	const statuses: LoopStatus[] = ["active", "paused", "done", "error"];
 	const status = statuses.includes(r.status as LoopStatus) ? (r.status as LoopStatus) : "active";
+	const shellModes: ShellMode[] = ["notify-output", "quiet", "verbose"];
 	return {
 		id: r.id,
 		name: typeof r.name === "string" && r.name.trim() ? r.name : undefined,
@@ -278,6 +284,7 @@ function normalizeLoop(raw: unknown): Loop | undefined {
 		command: typeof r.command === "string" ? r.command : undefined,
 		cwd: typeof r.cwd === "string" ? r.cwd : undefined,
 		timeoutMs: typeof r.timeoutMs === "number" ? r.timeoutMs : undefined,
+		shellMode: shellModes.includes(r.shellMode as ShellMode) ? (r.shellMode as ShellMode) : undefined,
 		followUpPrompt: typeof r.followUpPrompt === "string" ? r.followUpPrompt : undefined,
 		triggerTurn: typeof r.triggerTurn === "boolean" ? r.triggerTurn : undefined,
 		force: typeof r.force === "boolean" ? r.force : undefined,

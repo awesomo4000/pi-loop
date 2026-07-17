@@ -31,7 +31,8 @@ Everything is one command. The **first token** decides what happens:
 /loop <schedule> <prompt>              quick prompt loop (schedule-first shortcut)
 /loop <action> <schedule> <payload>    explicit action: prompt / notify / shell / message
 /loop !<schedule> <prompt>             forced loop — interrupt mid-run if the agent is busy
-/loop <verb> <name|id>                 control: pause / resume / delete / run
+/loop enable                           enable saved loops after session start
+/loop <verb> <name|id>                 control: enable / pause / resume / delete / run
 ```
 
 There's no list command — the widget under the editor (see below) always shows every loop with a live countdown. Pick a loop by name or id for control verbs.
@@ -77,6 +78,13 @@ Walks you through action → type → schedule → payload → name → max fire
 
 ### Controlling loops
 
+Saved loops never auto-start when a Pi session opens. If active loops were restored, the footer shows `saved · /loop enable`; review them in the widget, then enable all of them explicitly:
+
+```
+/loop enable                           # start all saved loops awaiting approval
+/loop enable build-check               # start one saved loop
+```
+
 **By name or id — no menu needed:**
 
 ```
@@ -110,8 +118,22 @@ Name matching is flexible: full id, id prefix, or unique name. With a single act
 |---|---|---|
 | **prompt** | wakes the agent with a prompt | polling CI, periodic work — the main use |
 | **notify** | a toast reminder (no agent wake) | "standup in 5 min" |
-| **shell** | runs a command on schedule | `npm test` every 5m; optional `followUpPrompt` wakes the agent with the output |
+| **shell** | runs a background command without waking the agent | message/build checkers; by default, silent when stdout is empty and notifies when stdout has content |
 | **message** | a line in the transcript | logging, breadcrumbs; optionally triggers a turn |
+
+For a quiet background checker, use the explicit `shell` action—not the schedule-first shortcut, which creates a `prompt` loop and wakes the agent every time:
+
+```bash
+/loop shell 5s your-message-checker
+```
+
+The checker should print nothing when there is no new message and print the notification text to stdout when there is one. Pi remains idle between checks. Shell reporting has three modes, selectable in the loop editor or `schedule_loop` tool:
+
+- `notify-output` (default): hide routine runs; notify only for non-empty stdout.
+- `quiet`: hide all successful runs and output.
+- `verbose`: show the command and every result.
+
+Do not set a `followUpPrompt` for a background-only checker; that option intentionally wakes the main agent after each run.
 
 ## When the agent is busy
 
@@ -169,6 +191,7 @@ No command needed — the widget under the editor always shows every loop:
 | `●` | active |
 | `❚❚` | paused |
 | `✗` | errored (last run failed) |
+| `🔒` | restored from disk and awaiting `/loop enable` |
 | `!` | forced loop — interrupts mid-run when busy |
 | `⏳` | a fire is buffered (waiting to deliver) |
 
@@ -201,7 +224,9 @@ delete the standup loop
 
 ## Persistence & limits
 
-- Loops persist to `.pi/loops.json` in the project. Reopening the project re-arms them automatically; paused loops stay paused.
+- Loops persist to `.pi/loops.json` in the project. Reopening the project displays them but does **not** run them until you use `/loop enable`; paused loops stay paused.
+- Context compaction does not restart the extension, so enabled timers keep running across `/compact` and automatic compaction without being duplicated.
+- Shell loops execute through `bash -lc`. Only enable saved shell loops when you trust the project and its `.pi/loops.json` file.
 - **One pi per project:** loops are project-scoped. Two pi instances in the same cwd will both fire shared loops — the single-developer case just works.
 
 ## License

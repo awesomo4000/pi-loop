@@ -29,7 +29,7 @@ import {
 	type ActionType,
 	type ScheduleType,
 } from "../src/schedule.ts";
-import { LoopStore, newId, planFire, type Loop } from "../src/store.ts";
+import { LoopStore, newId, planFire, type Loop, type ShellMode } from "../src/store.ts";
 import { getSettings, loadSettings, saveSettings, DEFAULT_SETTINGS, type RenderSettings, type FooterStyle } from "../src/settings.ts";
 import { formatRelative, loopPayloadPreview, loopPayloadRaw, loopScheduleLabel, safeParsed, displayName } from "../src/format.ts";
 
@@ -118,6 +118,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 	let store = new LoopStore(loopFilePath(process.cwd()));
 	const handles = new Map<string, Handle>();
 	const firing = new Set<string>();
+	// If a scheduled interval/cron occurrence arrives while the previous action is
+	// still running, remember one coalesced catch-up fire. Dropping the overlapping
+	// callback would otherwise leave interval loops permanently disarmed.
+	const queuedFires = new Set<string>();
+	// Persisted active loops never auto-start. Their ids remain here until the user
+	// explicitly enables them for this session with `/loop enable` (or resumes one).
+	const startupPending = new Set<string>();
 	// Fires that happened while the agent was busy. Keyed by loop id, so repeated
 	// fires of the same loop collapse to the latest — drained as ONE consolidated
 	// turn at agent_settled. Prevents the flood of chained followUp turns during
@@ -157,18 +164,25 @@ export default function loopExtension(pi: ExtensionAPI) {
 	/** Footer chip: "🔁 N loops · next Xm". Updated on every mutation and widget tick. */
 	function updateFooter(ctx: ExtensionContext) {
 		const theme = ctx.ui.theme;
-		const active = store.list().filter((l) => l.enabled && l.status !== "done" && l.status !== "error");
+		const pending = store.list().filter((l) => startupPending.has(l.id));
+		const active = store.list().filter(
+			(l) => l.enabled && l.status !== "done" && l.status !== "error" && !startupPending.has(l.id),
+		);
 		if (active.length === 0) {
-			ctx.ui.setStatus("loop", undefined);
+			ctx.ui.setStatus(
+				"loop",
+				pending.length > 0 ? theme.fg("warning", `🔁 ${pending.length} saved · /loop enable`) : undefined,
+			);
 			return;
 		}
 		const next = earliestNextRun(active);
 		const rel = next ? formatRelative(next, new Date()) : "";
 		const cfg = widgetConfig();
+		const pendingLabel = pending.length > 0 ? ` · ${pending.length} awaiting enable` : "";
 		const chip = cfg.footerStyle === "verbose"
 			? `🔁 ${active.length} loop${active.length === 1 ? "" : "s"}${rel ? ` · next ${rel}` : ""}`
 			: `🔁 ${active.length}${rel ? ` · ${rel}` : ""}`;
-		ctx.ui.setStatus("loop", theme.fg("accent", chip));
+		ctx.ui.setStatus("loop", theme.fg("accent", chip) + theme.fg("warning", pendingLabel));
 	}
 
 	/** Widget lines, laid out the Pi way (cf. custom-footer): fixed metadata columns +
@@ -190,8 +204,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 		for (const l of sorted) {
 			const glyphColor = l.status === "done" ? "success" : l.status === "error" ? "error" : "accent";
 			const glyph = theme.fg(glyphColor, statusGlyph(l));
-			const live = l.enabled && l.status !== "done" && l.status !== "error";
-			const nrText = live ? formatRelative(l.nextRun, new Date()) : (l.status === "done" ? "done" : "paused");
+			const awaitingEnable = startupPending.has(l.id);
+			const live = l.enabled && l.status !== "done" && l.status !== "error" && !awaitingEnable;
+			const nrText = awaitingEnable
+				? "awaiting enable"
+				: live
+					? formatRelative(l.nextRun, new Date())
+					: (l.status === "done" ? "done" : "paused");
 
 			// Fixed metadata segments (plain text; themed after measuring). Hidden columns drop out.
 			const metaParts: string[] = [];
@@ -203,7 +222,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const metaThemed = theme.fg("dim", metaPlain);
 
 			// Marks: ! (forced) + ⏳ (buffered). Themed.
-			const markThemed = (l.force ? " " + theme.fg("warning", "!") : "") + (pendingFires.has(l.id) ? " " + theme.fg("warning", "⏳") : "");
+			const markThemed = (awaitingEnable ? " " + theme.fg("warning", "🔒") : "") + (l.force ? " " + theme.fg("warning", "!") : "") + (pendingFires.has(l.id) ? " " + theme.fg("warning", "⏳") : "");
 
 			// Title/payload flex slot = whatever width remains.
 			const indent = 2;
@@ -221,7 +240,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 	/** Adaptive tick: 1s when a fire is <1m away, 30s under an hour, 10m beyond. */
 	function computeTickMs(): number {
-		const active = store.list().filter((l) => l.enabled && l.nextRun);
+		const active = store.list().filter((l) => l.enabled && l.nextRun && !startupPending.has(l.id));
 		if (active.length === 0) return 60_000;
 		const nearest = Math.min(...active.map((l) => Date.parse(l.nextRun!) - Date.now()));
 		if (nearest < 60_000) return 1000;
@@ -252,11 +271,33 @@ export default function loopExtension(pi: ExtensionAPI) {
 		for (const id of [...handles.keys()]) disarm(id);
 	}
 
-	/** Arm (or re-arm) a single loop's timer. Recomputes the next run. */
-	function arm(loop: Loop, ctx: ExtensionContext) {
+	/** Schedule a timeout for an absolute deadline, preserving deadlines beyond Node's timer cap. */
+	function scheduleAt(loop: Loop, ctx: ExtensionContext, dueAt: number) {
+		disarm(loop.id);
+		const remaining = Math.max(0, dueAt - Date.now());
+		const timer = setTimeout(() => {
+			handles.delete(loop.id);
+			const current = store.get(loop.id);
+			if (!current || !current.enabled || current.status === "done" || current.status === "error") return;
+			if (Date.now() < dueAt) {
+				scheduleAt(current, ctx, dueAt);
+				return;
+			}
+			void fire(loop.id, ctx);
+		}, Math.min(remaining, MAX_TIMER_DELAY_MS));
+		timer.unref?.();
+		handles.set(loop.id, { kind: "timeout", handle: timer });
+		store.update(loop.id, { nextRun: new Date(dueAt).toISOString() });
+	}
+
+	/** Arm (or re-arm) a loop. Restored interval/once loops may retain their persisted deadline. */
+	function arm(loop: Loop, ctx: ExtensionContext, preserveNextRun = false) {
 		if (!loop.enabled || loop.status === "done" || loop.status === "error") return;
 		const parsed = safeParsed(loop);
-		if (!parsed) return;
+		if (!parsed) {
+			store.update(loop.id, { status: "error", enabled: false, lastError: "invalid schedule" });
+			return;
+		}
 		disarm(loop.id);
 
 		if (parsed.type === "cron") {
@@ -278,33 +319,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		// interval or once — setTimeout, capped at the engine max.
-		const from = new Date();
-		const next = nextRun(parsed, from);
-		const dueAt = next.getTime();
-		const delay = Math.max(0, dueAt - from.getTime());
-		const timerDelay = Math.min(delay, MAX_TIMER_DELAY_MS);
-
-		const timer = setTimeout(() => {
-			handles.delete(loop.id);
-			// If the delay was capped (very far future), re-arm instead of firing early.
-			if (Date.now() < dueAt) {
-				arm(loop, ctx);
-				return;
-			}
-			void fire(loop.id, ctx);
-		}, timerDelay);
-		timer.unref?.();
-		handles.set(loop.id, { kind: "timeout", handle: timer });
-		store.update(loop.id, { nextRun: next.toISOString() });
-	}
-
-	function rescheduleAll(ctx: ExtensionContext) {
-		disarmAll();
-		for (const l of store.list()) {
-			if (l.enabled && l.status !== "done" && l.status !== "error") arm(l, ctx);
-		}
-		updateUI(ctx);
+		// Interval or once. On startup approval, keep the persisted absolute deadline
+		// so restarting does not postpone relative schedules such as `+10m`.
+		const persisted = preserveNextRun && loop.nextRun ? Date.parse(loop.nextRun) : Number.NaN;
+		const dueAt = Number.isFinite(persisted) ? persisted : nextRun(parsed, new Date()).getTime();
+		scheduleAt(loop, ctx, dueAt);
 	}
 
 	// ─── Firing ────────────────────────────────────────────────────────────────
@@ -313,7 +332,10 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const loop = store.get(id);
 		if (!loop || loop.status === "done" || loop.status === "error") return;
 		if (!manual && !loop.enabled) return; // pause stops the schedule, not a manual "run now"
-		if (firing.has(id)) return; // overlap guard
+		if (firing.has(id)) {
+			if (!manual) queuedFires.add(id); // coalesce missed scheduled occurrences into one catch-up fire
+			return;
+		}
 		firing.add(id);
 		try {
 			const now = new Date();
@@ -325,16 +347,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 			if (plan.terminal) {
 				disarm(id);
 			} else if (loop.enabled && loop.type === "interval" && plan.nextDelayMs !== undefined) {
-				const delay = Math.min(plan.nextDelayMs, MAX_TIMER_DELAY_MS);
-				const timer = setTimeout(() => {
-					handles.delete(id);
-					void fire(id, ctx);
-				}, delay);
-				timer.unref?.();
-				handles.set(id, { kind: "timeout", handle: timer });
-				store.update(id, { nextRun: new Date(now.getTime() + delay).toISOString() });
+				scheduleAt(loop, ctx, now.getTime() + plan.nextDelayMs);
+			} else if (loop.enabled && loop.type === "cron") {
+				const handle = handles.get(id);
+				const next = handle?.kind === "cron" ? handle.handle.nextRun() : null;
+				if (next) store.update(id, { nextRun: next.toISOString() });
 			}
-			// cron non-terminal: croner holds the handle; nothing to do.
 
 			store.update(id, { runCount: plan.runCount, lastRun: now.toISOString() });
 
@@ -366,6 +384,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 			updateUI(ctx);
 		} finally {
 			firing.delete(id);
+			if (queuedFires.delete(id)) {
+				const current = store.get(id);
+				if (current?.enabled && current.status !== "done" && current.status !== "error") {
+					void fire(id, ctx);
+				}
+			}
 		}
 	}
 
@@ -398,7 +422,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (loop.action === "shell") {
 			const cwd = loop.cwd || ctx.cwd;
 			const timeout = loop.timeoutMs ?? DEFAULT_SHELL_TIMEOUT_MS;
-			if (ctx.hasUI) ctx.ui.notify(`▶ ${label}: ${loop.command}`, "info");
+			const shellMode = loop.shellMode ?? "notify-output";
+			if (shellMode === "verbose" && ctx.hasUI) ctx.ui.notify(`▶ ${label}: ${loop.command}`, "info");
 			const result = await pi.exec("bash", ["-lc", loop.command || ""], { cwd, timeout });
 			const summary = {
 				command: loop.command,
@@ -409,7 +434,16 @@ export default function loopExtension(pi: ExtensionAPI) {
 				stdout: truncateMiddle(result.stdout, MAX_OUTPUT_CHARS),
 				stderr: truncateMiddle(result.stderr, MAX_OUTPUT_CHARS),
 			};
-			record(ctx, `▣ ${label}: exit ${result.code}`, { loop, result: summary });
+			if (shellMode === "verbose") {
+				record(ctx, `▣ ${label}: exit ${result.code}`, { loop, result: summary });
+			} else if (shellMode === "notify-output" && summary.ok && summary.stdout.trim()) {
+				const output = summary.stdout.trim();
+				if (ctx.hasUI) ctx.ui.notify(output, "info");
+				record(ctx, `🔔 ${truncateMiddle(output, 2_000)}`, {
+					loopId: loop.id,
+					result: { code: result.code, killed: result.killed },
+				});
+			}
 			if (loop.followUpPrompt) {
 				const block = [
 					"A scheduled shell command completed.",
@@ -430,6 +464,13 @@ export default function loopExtension(pi: ExtensionAPI) {
 					loop.followUpPrompt,
 				].join("\n");
 				sendAgentPrompt(ctx, loop, wrapScheduled(block));
+			}
+			if (!summary.ok) {
+				throw new Error(
+					result.killed
+						? `Shell command timed out or was killed (exit ${result.code})`
+						: `Shell command exited with code ${result.code}`,
+				);
 			}
 			return;
 		}
@@ -509,6 +550,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		command?: string;
 		cwd?: string;
 		timeoutMs?: number;
+		shellMode?: ShellMode;
 		followUpPrompt?: string;
 		triggerTurn?: boolean;
 		force?: boolean;
@@ -522,10 +564,21 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (params.action === "notify" && !(params.message?.trim())) throw new Error("message is required for action 'notify'");
 		if (params.action === "message" && !(params.message?.trim())) throw new Error("message is required for action 'message'");
 		if (params.action === "shell" && !(params.command?.trim())) throw new Error("command is required for action 'shell'");
+		if (params.maxFires !== undefined && (!Number.isInteger(params.maxFires) || params.maxFires < 1)) {
+			throw new Error("maxFires must be a positive integer");
+		}
+		if (params.timeoutMs !== undefined && (!Number.isFinite(params.timeoutMs) || params.timeoutMs < 1000)) {
+			throw new Error("timeoutMs must be at least 1000");
+		}
 
 		// Defense-in-depth: a very short interval with no maxFires is almost always a
 		// test/spam footgun (fires forever, rapidly). Warn — don't block.
-		if (parsed.intervalMs !== undefined && parsed.intervalMs < 10_000 && params.maxFires === undefined) {
+		if (
+			parsed.type === "interval" &&
+			parsed.intervalMs !== undefined &&
+			parsed.intervalMs < 10_000 &&
+			params.maxFires === undefined
+		) {
 			ctx.ui.notify(
 				`Interval ${params.schedule} has no maxFires — it will fire rapidly forever. Set maxFires or use a longer interval.`,
 				"warning",
@@ -548,8 +601,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 				message: params.message,
 				command: params.command,
 				cwd: params.cwd ?? ctx.cwd,
-				timeoutMs: params.timeoutMs,
-				followUpPrompt: params.followUpPrompt,
+					timeoutMs: params.timeoutMs,
+					shellMode: params.shellMode,
+					followUpPrompt: params.followUpPrompt,
 				triggerTurn: params.triggerTurn,
 				force: params.force,
 				enabled: params.enabled,
@@ -565,29 +619,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	// Reset the per-turn steer coalesce flag so forced (!) loops can steer again next turn.
 	pi.on("turn_end", async () => {
 		steeredThisTurn = false;
-	});
-
-	// SOTA policy block (XML + rule-triples + banned behaviors), injected ONLY when
-	// loops exist — zero token cost otherwise. Honest enforcement mapping: R1/R2 are
-	// code-enforced (concurrent fires coalesce; maxFires auto-removes); R3/R4 are prose
-	// only (we can't refuse a tool call) and marked as such — no fake gates.
-	pi.on("before_agent_start", async (event, ctx) => {
-		if (store.list().length === 0) return; // nothing to govern
-		const policy = `
-<loop_policy authority="schedule_loop / stop_loop / list_loops usage">
-  <bannedBehaviors>
-  - Do NOT create multiple loops with the same interval for one goal. Use ONE interval loop with maxFires.
-  - Do NOT create a polling loop without maxFires — it runs forever.
-  - Do NOT use action='prompt' when notify or message would suffice.
-  </bannedBehaviors>
-  <rules>
-  R1 lockstep: invariant ≤ one loop per periodic goal | enforced: concurrent fires coalesce (code) | recovery: stop_loop the duplicates, keep one with maxFires.
-  R2 bounded: invariant every polling loop ends | enforced: maxFires auto-removes the loop (code) | recovery: set maxFires; stop_loop orphans.
-  R3 action-fit: invariant do not wake the agent needlessly | enforced: none (prose) | recovery: switch prompt → notify (reminder) or message (log).
-  R4 force: invariant force=true only for time-sensitive triggers | enforced: none (prose) | recovery: leave force unset.
-  </rules>
-</loop_policy>`;
-		return { systemPrompt: `${event.systemPrompt}\n\n${policy}` };
+		if (activeCtx) maybeSteer(activeCtx);
 	});
 
 	// Drain buffered (default-deferred) fires as one consolidated turn when the
@@ -601,10 +633,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 		store = new LoopStore(loopFilePath(ctx.cwd));
 		await store.load();
 		await loadSettings();
+		disarmAll();
+		queuedFires.clear();
+		startupPending.clear();
+		for (const loop of store.list()) {
+			if (loop.enabled && loop.status !== "done" && loop.status !== "error") startupPending.add(loop.id);
+		}
 		pendingFires.clear();
 		if (idleFlushTimer) { clearTimeout(idleFlushTimer); idleFlushTimer = undefined; }
 		activeCtx = ctx;
-		rescheduleAll(ctx);
 		// Mount the widget ONCE via the factory form. The component reads the live
 		// store at render time and self-ticks adaptively — no more setWidget churn.
 		if (ctx.hasUI) {
@@ -624,10 +661,25 @@ export default function loopExtension(pi: ExtensionAPI) {
 			);
 		}
 		updateUI(ctx);
+		if (ctx.hasUI && startupPending.size > 0) {
+			ctx.ui.notify(
+				`${startupPending.size} saved loop${startupPending.size === 1 ? " is" : "s are"} waiting. Use /loop enable to start ${startupPending.size === 1 ? "it" : "them"}.`,
+				"warning",
+			);
+		}
+	});
+
+	// Compaction only rewrites conversation context; this extension instance and
+	// its timer handles remain live. Refreshing the UI makes that invariant visible.
+	pi.on("session_compact", async (_event, ctx) => {
+		await store.persist();
+		updateUI(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		pendingFires.clear();
+		queuedFires.clear();
+		startupPending.clear();
 		loopWidget?.dispose();
 		loopWidget = undefined;
 		disarmAll();
@@ -656,19 +708,35 @@ export default function loopExtension(pi: ExtensionAPI) {
 	//   else                                            → prompt action, schedule-first
 	// Cron schedules contain spaces → quote them: /loop "*/5 * * * *" check the build
 	const ACTION_VERBS = new Set<ActionType>(["prompt", "notify", "shell", "message"]);
-	const CONTROL_VERBS = new Set<string>(["pause", "resume", "delete", "remove", "run"]);
+	const CONTROL_VERBS = new Set<string>(["enable", "pause", "resume", "delete", "remove", "run"]);
 
-	/** Quote-aware tokenizer: double quotes keep cron expressions (and multi-word payloads) whole. */
-	function tokenize(s: string): string[] {
-		const out: string[] = [];
-		let cur = "";
-		let inQ = false;
-		for (const c of s) {
-			if (c === '"') { inQ = !inQ; continue; }
-			if (!inQ && /\s/.test(c)) { if (cur) { out.push(cur); cur = ""; } continue; }
-			cur += c;
+	/** Quote-aware tokens with source spans. Payloads are sliced from the original input so shell quoting survives. */
+	function tokenize(s: string): Array<{ value: string; start: number; end: number }> {
+		const out: Array<{ value: string; start: number; end: number }> = [];
+		let i = 0;
+		while (i < s.length) {
+			while (i < s.length && /\s/.test(s[i])) i++;
+			if (i >= s.length) break;
+			const start = i;
+			let value = "";
+			let quote: '"' | "'" | undefined;
+			while (i < s.length) {
+				const c = s[i];
+				if (quote) {
+					if (c === quote) { quote = undefined; i++; continue; }
+					if (c === "\\" && quote === '"' && i + 1 < s.length) { value += s[i + 1]; i += 2; continue; }
+					value += c;
+					i++;
+					continue;
+				}
+				if (c === '"' || c === "'") { quote = c; i++; continue; }
+				if (/\s/.test(c)) break;
+				if (c === "\\" && i + 1 < s.length) { value += s[i + 1]; i += 2; continue; }
+				value += c;
+				i++;
+			}
+			out.push({ value, start, end: i });
 		}
-		if (cur) out.push(cur);
 		return out;
 	}
 
@@ -687,21 +755,45 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	// Shared control ops — used by both the CLI verbs and the interactive menu.
+	function enablePendingLoops(ctx: ExtensionContext, loops?: Loop[]) {
+		const candidates = (loops ?? store.list()).filter((loop) => startupPending.has(loop.id));
+		for (const loop of candidates) {
+			startupPending.delete(loop.id);
+			if (loop.enabled && loop.status !== "done" && loop.status !== "error") arm(loop, ctx, true);
+		}
+		updateUI(ctx);
+		if (candidates.length === 0) {
+			ctx.ui.notify("No saved loops are waiting to be enabled.", "info");
+		} else {
+			ctx.ui.notify(
+				`Enabled ${candidates.length} saved loop${candidates.length === 1 ? "" : "s"} for this session.`,
+				"info",
+			);
+		}
+	}
+
 	function pauseLoop(loop: Loop, ctx: ExtensionContext) {
 		disarm(loop.id);
+		startupPending.delete(loop.id);
+		queuedFires.delete(loop.id);
+		pendingFires.delete(loop.id);
 		store.update(loop.id, { enabled: false, status: "paused", nextRun: undefined });
 		void store.persist();
 		updateUI(ctx);
 		ctx.ui.notify(`Paused "${displayName(loop)}"`, "info");
 	}
 	function resumeLoop(loop: Loop, ctx: ExtensionContext) {
+		const preserveNextRun = startupPending.delete(loop.id);
 		const updated = store.update(loop.id, { enabled: true, status: "active" })!;
-		arm(updated, ctx);
+		arm(updated, ctx, preserveNextRun);
 		updateUI(ctx);
 		ctx.ui.notify(`Resumed "${displayName(loop)}"`, "info");
 	}
 	function deleteLoop(loop: Loop, ctx: ExtensionContext) {
 		disarm(loop.id);
+		startupPending.delete(loop.id);
+		queuedFires.delete(loop.id);
+		pendingFires.delete(loop.id);
 		store.remove(loop.id);
 		updateUI(ctx);
 		ctx.ui.notify(`Deleted "${displayName(loop)}"`, "info");
@@ -712,10 +804,18 @@ export default function loopExtension(pi: ExtensionAPI) {
 	}
 
 	async function controlLoop(verb: string, query: string, ctx: ExtensionContext) {
+		if (verb === "enable" && !query) return enablePendingLoops(ctx);
 		const loop = resolveQuery(ctx, query);
 		if (!loop) return;
+		if (verb === "enable") {
+			if (startupPending.has(loop.id)) return enablePendingLoops(ctx, [loop]);
+			if (!loop.enabled) return resumeLoop(loop, ctx);
+			ctx.ui.notify(`"${displayName(loop)}" is already enabled`, "info");
+			return;
+		}
 		if (verb === "pause") return pauseLoop(loop, ctx);
 		if (verb === "resume") {
+			if (startupPending.has(loop.id)) return resumeLoop(loop, ctx);
 			if (loop.enabled) { ctx.ui.notify(`"${displayName(loop)}" is already active`, "info"); return; }
 			return resumeLoop(loop, ctx);
 		}
@@ -726,7 +826,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 	/** Disarm + arm, recomputing nextRun. Used after edits that change scheduling. */
 	function rearm(loop: Loop, ctx: ExtensionContext) {
 		disarm(loop.id);
-		if (loop.enabled && loop.status !== "done" && loop.status !== "error") arm(loop, ctx);
+		if (
+			loop.enabled &&
+			loop.status !== "done" &&
+			loop.status !== "error" &&
+			!startupPending.has(loop.id)
+		) arm(loop, ctx);
 		updateUI(ctx);
 	}
 
@@ -744,6 +849,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 				`Schedule       ${schedLabel}`,
 				`Force (!)      ${loop.force ? "on" : "off"}`,
 				`Payload        ${payloadLabel}`,
+				...(loop.action === "shell" ? [`Shell reporting ${loop.shellMode ?? "notify-output"}`] : []),
 				`Name           ${loop.name ?? "(none)"}`,
 				`Max fires      ${loop.maxFires ? String(loop.maxFires) : "forever"}`,
 				"Done",
@@ -771,7 +877,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 					}
 					if (schedule) {
 						const parsed = validateSchedule(type, schedule, new Date());
-						const updated = store.update(loop.id, { type: parsed.type, schedule: parsed.schedule, intervalMs: parsed.intervalMs })!;
+						const updated = store.update(loop.id, {
+							type: parsed.type,
+							schedule: parsed.schedule,
+							intervalMs: parsed.intervalMs,
+							nextRun: undefined,
+						})!;
 						loop = updated;
 						rearm(loop, ctx);
 						ctx.ui.notify(`Schedule → ${loopScheduleLabel(loop)}`, "info");
@@ -787,6 +898,20 @@ export default function loopExtension(pi: ExtensionAPI) {
 					if (edited === undefined) continue;
 					loop = store.update(loop.id, { [field]: edited } as Partial<Loop>)!;
 					ctx.ui.notify("Payload updated", "info");
+				} else if (choice.startsWith("Shell reporting")) {
+					const selected = await ctx.ui.select("Shell reporting", [
+						"Notify on stdout — silent checks; notify when stdout is non-empty",
+						"Quiet — suppress successful checks and output",
+						"Verbose — show the command and every result",
+					]);
+					if (!selected) continue;
+					const shellMode: ShellMode = selected.startsWith("Notify")
+						? "notify-output"
+						: selected.startsWith("Quiet")
+							? "quiet"
+							: "verbose";
+					loop = store.update(loop.id, { shellMode })!;
+					ctx.ui.notify(`Shell reporting → ${shellMode}`, "info");
 				} else if (choice.startsWith("Name")) {
 					const edited = await ctx.ui.input("Name", loop.name ?? "");
 					if (edited === undefined) continue;
@@ -827,33 +952,33 @@ export default function loopExtension(pi: ExtensionAPI) {
 			if (!trimmed) return manage(ctx); // wizard
 
 			const tokens = tokenize(trimmed);
-			const verb = tokens[0].toLowerCase();
+			const verb = tokens[0].value.toLowerCase();
 
 			// Control verbs: /loop pause|resume|delete|remove|run [name|id]
 			if (CONTROL_VERBS.has(verb)) {
-				return controlLoop(verb, tokens.slice(1).join(" ").trim(), ctx);
+				return controlLoop(verb, tokens.slice(1).map((token) => token.value).join(" ").trim(), ctx);
 			}
 
 			// Optional action verb: /loop prompt|notify|shell|message <schedule> <payload>
 			let action: ActionType = "prompt";
-			let rest = trimmed;
+			let scheduleIndex = 0;
 			if (ACTION_VERBS.has(verb as ActionType)) {
 				action = verb as ActionType;
-				rest = tokens.slice(1).join(" ");
-				if (!rest) {
+				scheduleIndex = 1;
+				if (tokens.length === 1) {
 					ctx.ui.notify(`Usage: /loop ${verb} <schedule> <payload>`, "warning");
 					return;
 				}
 			}
 
-			// schedule = first remaining token, payload = the rest
-			const restTokens = tokenize(rest);
-			if (restTokens.length < 2) {
+			// Schedule is one decoded token; payload is the untouched remainder so shell
+			// quotes, escapes, substitutions, and redirects retain their intended meaning.
+			if (tokens.length < scheduleIndex + 2) {
 				ctx.ui.notify("Usage: /loop [action] <schedule> <payload>", "warning");
 				return;
 			}
-			const schedule = restTokens[0];
-			const payload = restTokens.slice(1).join(" ");
+			const schedule = tokens[scheduleIndex].value;
+			const payload = trimmed.slice(tokens[scheduleIndex + 1].start).trim();
 
 			try {
 				const params: Parameters<typeof createLoop>[0] = { action, schedule, force };
@@ -869,15 +994,22 @@ export default function loopExtension(pi: ExtensionAPI) {
 	});
 
 	async function manage(ctx: ExtensionContext) {
-		const choice = await ctx.ui.select("Loops", ["Add a loop…", "List / manage…", "Settings…", "Pause all", "Resume all", "Clear all"]);
+		const choices = ["Add a loop…", "List / manage…", "Settings…"];
+		if (startupPending.size > 0) choices.push("Enable saved loops");
+		choices.push("Pause all", "Resume all", "Clear all");
+		const choice = await ctx.ui.select("Loops", choices);
 		if (!choice) return;
 		if (choice === "Add a loop…") return addLoop(ctx);
 		if (choice === "List / manage…") return manageOne(ctx);
 		if (choice === "Settings…") return widgetSettings(ctx);
+		if (choice === "Enable saved loops") return enablePendingLoops(ctx);
 		if (choice === "Pause all") {
 			for (const l of store.list()) {
 				if (l.enabled) {
 					disarm(l.id);
+					startupPending.delete(l.id);
+					queuedFires.delete(l.id);
+					pendingFires.delete(l.id);
 					store.update(l.id, { enabled: false, status: "paused", nextRun: undefined });
 				}
 			}
@@ -901,6 +1033,9 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const ok = await ctx.ui.confirm("Clear all loops?", "This removes every loop. Cannot be undone.");
 			if (!ok) return;
 			disarmAll();
+			startupPending.clear();
+			queuedFires.clear();
+			pendingFires.clear();
 			store.clear();
 			updateUI(ctx);
 			ctx.ui.notify("All loops cleared", "info");
@@ -962,6 +1097,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		let prompt: string | undefined;
 		let message: string | undefined;
 		let command: string | undefined;
+		let shellMode: ShellMode | undefined;
 		let followUpPrompt: string | undefined;
 		if (action === "prompt") {
 			prompt = await ctx.ui.input("Prompt", "What should the agent do when this fires?");
@@ -975,6 +1111,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 		} else {
 			command = await ctx.ui.input("Shell command", "e.g. npm test");
 			if (!command) return;
+			const reporting = await ctx.ui.select("Shell reporting", [
+				"Notify on stdout — silent checks; notify when stdout is non-empty",
+				"Quiet — suppress successful checks and output",
+				"Verbose — show the command and every result",
+			]);
+			if (!reporting) return;
+			shellMode = reporting.startsWith("Notify")
+				? "notify-output"
+				: reporting.startsWith("Quiet")
+					? "quiet"
+					: "verbose";
 			followUpPrompt = (await ctx.ui.input("Follow-up prompt (optional, Enter to skip)", "Wake the agent with the output?")) || undefined;
 		}
 
@@ -1003,7 +1150,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 		try {
 			const loop = createLoop(
-				{ action, type, schedule, name, prompt, message, command, followUpPrompt, maxFires, force },
+				{ action, type, schedule, name, prompt, message, command, shellMode, followUpPrompt, maxFires, force },
 				ctx,
 			);
 			ctx.ui.notify(`Created loop "${displayName(loop)}" (${loopScheduleLabel(loop)})`, "info");
@@ -1071,14 +1218,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 		if (!loop) return;
 
 		const opts: string[] = [];
-		if (loop.enabled) opts.push("Pause");
+		if (startupPending.has(loop.id)) opts.push("Enable");
+		else if (loop.enabled) opts.push("Pause");
 		else if (loop.status !== "done" && loop.status !== "error") opts.push("Resume");
 		opts.push("Run now", "Edit…", "Delete");
 
 		const action = await ctx.ui.select(`${displayName(loop)} (${loopScheduleLabel(loop)})`, opts);
 		if (!action) return;
 
-		if (action === "Pause") {
+		if (action === "Enable") {
+			enablePendingLoops(ctx, [loop]);
+		} else if (action === "Pause") {
 			pauseLoop(loop, ctx);
 		} else if (action === "Resume") {
 			resumeLoop(loop, ctx);
@@ -1097,7 +1247,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		name: "schedule_loop",
 		label: "Schedule Loop",
 		description:
-			"Schedule a recurring or one-shot loop in this Pi session that can wake the agent with a prompt, run a shell command, post a message, or notify the user. Persists across restarts. Shows in the status bar.",
+			"Schedule a recurring or one-shot loop in this Pi session that can wake the agent with a prompt, run a shell command, post a message, or notify the user. Persists across restarts but requires /loop enable in each new session. Shows in the status bar.",
 		promptSnippet: "Schedule a recurring or one-shot loop (prompt/notify/shell/message) on a timer or cron",
 		promptGuidelines: [
 			"Use schedule_loop for periodic or deferred work — 'check CI every 5 min', 'remind me at 9am', 'poll until the build passes', 'run npm test hourly'.",
@@ -1128,9 +1278,15 @@ export default function loopExtension(pi: ExtensionAPI) {
 			),
 			cwd: Type.Optional(Type.String({ description: "Shell working directory. Defaults to current cwd." })),
 			timeoutMs: Type.Optional(Type.Number({ description: "Shell timeout ms.", minimum: 1000 })),
+			shellMode: Type.Optional(
+				StringEnum(["notify-output", "quiet", "verbose"] as const, {
+					description:
+						"Shell reporting. Default 'notify-output' runs silently and notifies only when stdout is non-empty; 'quiet' suppresses successful output; 'verbose' shows every run.",
+				}),
+			),
 			name: Type.Optional(Type.String({ description: "Human-readable loop name." })),
 			maxFires: Type.Optional(
-				Type.Number({ description: "Stop after this many fires (recurring only).", minimum: 1 }),
+				Type.Integer({ description: "Stop after this many fires (recurring only).", minimum: 1 }),
 			),
 			enabled: Type.Optional(Type.Boolean({ description: "Start enabled. Default true." })),
 			triggerTurn: Type.Optional(
@@ -1171,7 +1327,12 @@ export default function loopExtension(pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: "No loops scheduled." }], details: {} };
 			}
 			const lines = loops.map((l) => {
-				const next = l.nextRun && l.enabled ? formatRelative(l.nextRun, new Date()) : l.status;
+				const awaitingEnable = startupPending.has(l.id);
+				const next = awaitingEnable
+					? "awaiting /loop enable"
+					: l.nextRun && l.enabled
+						? formatRelative(l.nextRun, new Date())
+						: l.status;
 				return `- ${l.id} ${displayName(l)} [${l.action}/${l.type}] ${loopScheduleLabel(l)} next=${next} runs=${l.runCount}${l.lastStatus === "error" ? " last=error" : ""}`;
 			});
 			return {
@@ -1194,11 +1355,17 @@ export default function loopExtension(pi: ExtensionAPI) {
 			if (!loop) throw new Error(`No loop matching "${params.query}"`);
 			if (params.delete) {
 				disarm(loop.id);
+				startupPending.delete(loop.id);
+				queuedFires.delete(loop.id);
+				pendingFires.delete(loop.id);
 				store.remove(loop.id);
 				updateUI(ctx);
 				return { content: [{ type: "text", text: `Deleted loop "${displayName(loop)}".` }], details: { loop } };
 			}
 			disarm(loop.id);
+			startupPending.delete(loop.id);
+			queuedFires.delete(loop.id);
+			pendingFires.delete(loop.id);
 			store.update(loop.id, { enabled: false, status: "paused", nextRun: undefined });
 			void store.persist();
 			updateUI(ctx);
